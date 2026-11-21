@@ -33,6 +33,7 @@ async function switchAvatar(name){
    el('licenseNotice').textContent='모델: Mr Squirrel · CC0';
    msg.textContent='다람쥐 선택 완료';
   }
+  clearVoice();voiceState.lastKind='';voiceState.lastAt=-30000;
   status('캐릭터 준비 완료');
  }catch(e){
   // Rebind the previous cached model if the new one did not pass validation.
@@ -46,7 +47,8 @@ document.querySelectorAll('input[name=avatar]').forEach(input=>input.addEventLis
 const neutral={a:0,i:0,u:0,e:0,o:0,blink_l:0,blink_r:0,joy:0,angry:0,sorrow:0,fun:0,yaw:0,pitch:0,roll:0};
 const target={...neutral},current={...neutral};
 const exprTargets={a:11,i:9,u:7,e:10,o:8,blink_l:1,blink_r:0,joy:5,angry:4,sorrow:3,fun:6};
-let frameAt=0,lastWidth=0,lastHeight=0,autoStarting=false,inferTurn=0;let renderScale=1,slowFpsWindows=0,fastFpsWindows=0;let fpsFrames=0,fpsAt=0;
+// v20: FHD pixel count remains fixed; optimize computation and compositing instead.
+let frameAt=0,lastWidth=0,lastHeight=0,lastDpr=0,autoStarting=false,inferTurn=0;let fpsFrames=0,fpsAt=0;
 // Worker performs CPU MediaPipe inference away from requestAnimationFrame.
 // A bounded main-thread fallback keeps the app usable on browsers that restrict workers.
 const aiPerf={timer:null,token:0,faceMs:75,poseMs:150,faceCost:0,poseCost:0,nextFace:0,nextPose:0};
@@ -121,19 +123,22 @@ function beginInference(){
    }
   }else{
    // Max one synchronous CPU inference per tick on browsers without worker support.
-   if(landmarker&&now>=aiPerf.nextFace){
-    const before=performance.now();detect(before);const cost=performance.now()-before;
-    aiPerf.faceCost=aiPerf.faceCost*.85+cost*.15;
-    aiPerf.faceMs=aiPerf.faceCost>28?125:aiPerf.faceCost>16?95:70;
-    aiPerf.nextFace=performance.now()+aiPerf.faceMs;
-   }else if(poseLandmarker&&now>=aiPerf.nextPose){
+   const faceDue=landmarker&&now>=aiPerf.nextFace;
+   const poseDue=poseLandmarker&&now>=aiPerf.nextPose;
+   const choosePose=poseDue&&(!faceDue||(now-aiPerf.nextPose)/aiPerf.poseMs>(now-aiPerf.nextFace)/aiPerf.faceMs);
+   if(choosePose){
     const before=performance.now();detectPose(before);const cost=performance.now()-before;
     aiPerf.poseCost=aiPerf.poseCost*.85+cost*.15;
     aiPerf.poseMs=aiPerf.poseCost>35?240:aiPerf.poseCost>20?180:130;
     aiPerf.nextPose=performance.now()+aiPerf.poseMs;
+   }else if(faceDue){
+    const before=performance.now();detect(before);const cost=performance.now()-before;
+    aiPerf.faceCost=aiPerf.faceCost*.85+cost*.15;
+    aiPerf.faceMs=aiPerf.faceCost>28?125:aiPerf.faceCost>16?95:70;
+    aiPerf.nextFace=performance.now()+aiPerf.faceMs;
    }
   }
-  aiPerf.timer=setTimeout(tick,25);
+  aiPerf.timer=setTimeout(tick,workerReady?(workerFrameInFlight?30:16):24);
  };
  aiPerf.timer=setTimeout(tick,30);
 }
@@ -155,7 +160,17 @@ const rigBones={};
 const aimVec=new THREE.Vector3(),fromVec=new THREE.Vector3(),parentQuat=new THREE.Quaternion(),aimQuat=new THREE.Quaternion(),worldQuat=new THREE.Quaternion(),boneWorld=new THREE.Vector3(),childWorld=new THREE.Vector3();
 const poseInfo={left:[],right:[],waist:0,lean:0};
 const poseSmooth={left:[],right:[]};
-let poseBlend=0, lastPoseFrame=0;let activeMorphs=[];
+let poseBlend=0, lastPoseFrame=0;
+// Reuse expression bindings and math temporaries; never allocate arrays in every RAF.
+let morphTracks=[];
+const poseChestQ=new THREE.Quaternion(),poseLeanQ=new THREE.Quaternion(),poseEuler=new THREE.Euler();
+const poseShoulderQ=new THREE.Quaternion(),poseShoulderDelta=new THREE.Quaternion();
+const aimDeltaQ=new THREE.Quaternion();
+const poseSides=['left','right'];
+const torsoKeys=['chest','upperChest'];
+const expressionKeys=Object.keys(target);
+const exprDrivePairs=Object.entries(exprTargets);
+const expressionWeights=Object.create(null);
 const smoothing=(a,b,k)=>a+(b-a)*k;
 // Low-latency phrase echo: 170ms end-of-speech hold; local temporary memory only.
 // Avoid open-speaker live monitor: it causes acoustic feedback in a public exhibit.
@@ -217,8 +232,10 @@ async function playEcho(mime){
   if(!echo.enabled||token!==echo.serial||!echo.ctx||buffer.duration<.25||buffer.duration>7)return;
   if('speechSynthesis' in window){speechSynthesis.cancel();el('voiceBubble').hidden=true;}
   const source=echo.ctx.createBufferSource(),filter=echo.ctx.createBiquadFilter(),gain=echo.ctx.createGain();
-  source.buffer=buffer;source.playbackRate.value=1.46;filter.type='highpass';filter.frequency.value=310;gain.gain.value=.88;
-  const bright=echo.ctx.createBiquadFilter();bright.type='peaking';bright.frequency.value=2500;bright.Q.value=.8;bright.gain.value=5;source.connect(filter);filter.connect(bright);bright.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
+  source.buffer=buffer;const animeVoice=selectedAvatar==='anime';
+  source.playbackRate.value=animeVoice?1.18:1.55;
+  filter.type='highpass';filter.frequency.value=animeVoice?160:340;gain.gain.value=animeVoice?.92:.88;
+  const bright=echo.ctx.createBiquadFilter();bright.type='peaking';bright.frequency.value=animeVoice?3200:2450;bright.Q.value=.8;bright.gain.value=animeVoice?2.5:5;source.connect(filter);filter.connect(bright);bright.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
   source.onended=()=>{try{source.disconnect();filter.disconnect();bright.disconnect();gain.disconnect()}catch{};source.buffer=null;if(token===echo.serial){echo.playing=false;echo.source=null;echo.cooldown=performance.now()+300;el('echo').textContent='🎤 말 따라하기 끄기'}};source.start();
  }catch(e){console.warn('Local voice echo unavailable:',e)}finally{if(token===echo.serial&&!echo.source){echo.playing=false;echo.cooldown=performance.now()+700;el('echo').textContent='🎤 말 따라하기 끄기'}echo.chunks.length=0;}
 }
@@ -226,15 +243,18 @@ async function playEcho(mime){
 
 // Speech is based only on sustained facial expressions, never individual transient frames.
 const voiceState={kind:'neutral',since:0,lastAt:-30000,lastKind:'',lastSpoken:'',enabled:true};
-const voiceLines={joy:['좋은 일 있나 봐?','웃는 얼굴이 정말 보기 좋아!','오늘 기분이 좋은가 봐!'],negative:['무슨 일 있어? 한번 웃어 볼래?','괜찮아? 다람쥐 친구가 응원할게!','조금 지쳤나 봐. 웃는 얼굴도 보여 줘!'],surprise:['와! 깜짝 놀랐나 봐!','무슨 재미있는 걸 봤어?']};
+const voiceLines={joy:['좋은 일 있나 봐?','웃는 얼굴이 정말 보기 좋아!','오늘 기분이 좋은가 봐!'],negative:['무슨 일 있어? 한번 웃어 볼래?','괜찮아? 내가 응원할게!','조금 지쳤나 봐. 웃는 얼굴도 보여 줘!'],surprise:['와! 깜짝 놀랐나 봐!','무슨 재미있는 걸 봤어?']};
 function voiceSay(kind){
  if(!voiceState.enabled||echo.enabled||!('speechSynthesis' in window)||document.hidden)return;
  const lines=voiceLines[kind]||[];
  let line=lines.find(x=>x!==voiceState.lastSpoken)||lines[0]; if(!line)return;
  voiceState.lastSpoken=line; voiceState.lastKind=kind; voiceState.lastAt=performance.now();
  const bubble=el('voiceBubble');bubble.textContent=line;bubble.hidden=false;
- try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(line);s.lang='ko-KR';s.rate=1.15;s.pitch=1.6;s.volume=.85;
- const voices=speechSynthesis.getVoices();s.voice=voices.find(v=>v.lang.toLowerCase().startsWith('ko')&&v.localService)||voices.find(v=>v.lang.toLowerCase().startsWith('ko'))||null;
+ try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(line);s.lang='ko-KR';s.rate=selectedAvatar==='anime'?1.02:1.2;s.pitch=selectedAvatar==='anime'?1.27:1.65;s.volume=.85;
+ const voices=speechSynthesis.getVoices();const korean=voices.filter(v=>v.lang.toLowerCase().startsWith('ko'));
+ // Prefer known feminine Korean voices if installed; browser/OS voices vary.
+ const feminine=/female|woman|여성|여자|지현|유나|서연|하은|sunhi|heami|yuna|seo-yeon|sora/i;
+ s.voice=selectedAvatar==='anime'?(korean.find(v=>feminine.test(v.name))||korean.find(v=>v.localService)||korean[0]||null):(korean.find(v=>v.localService)||korean[0]||null);
  s.onend=()=>{bubble.hidden=true};s.onerror=()=>{bubble.hidden=true};speechSynthesis.speak(s);
  }catch(e){hint('음성 출력이 제한되어 있어요. 화면을 한 번 눌러 주세요.')}
 }
@@ -262,7 +282,7 @@ el('full').onclick=async()=>{try{if(document.fullscreenElement)await document.ex
 async function bindAvatar(gltf,kind){
  if(character)scene.remove(character);
  character=gltf.scene;scene.add(character);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;
- morphMeshes=[];headBone=null;animeMorphBindings=null;activeMorphs=[];
+ morphMeshes=[];headBone=null;animeMorphBindings=null;morphTracks=[];
  for(const key of Object.keys(rigBones))delete rigBones[key];
  character.traverse(o=>{if(o.isMesh&&o.morphTargetInfluences?.length){morphMeshes.push(o);o.frustumCulled=false;}if(o.isSkinnedMesh)o.frustumCulled=false;});
  const vrmHumanoid=gltf.parser.json.extensions?.VRM?.humanoid?.humanBones||[];
@@ -270,11 +290,33 @@ async function bindAvatar(gltf,kind){
  headBone=await bone('head');if(headBone)headBone.userData.restRot=headBone.rotation.clone();
  character.rotation.y=Math.PI;
  const leftArm=await bone('leftUpperArm'),rightArm=await bone('rightUpperArm');
- if(leftArm)leftArm.rotation.z+=1.08;
- if(rightArm)rightArm.rotation.z-=1.08;
  const leftForearm=await bone('leftLowerArm'),rightForearm=await bone('rightLowerArm');
- if(leftForearm)leftForearm.rotation.z+=.12;
- if(rightForearm)rightForearm.rotation.z-=.12;
+ if(kind==='anime'){
+  // A-pose/rest pose: compute anatomically from arm segments, not a fixed rotation
+  // that may turn the VRoid A-pose into a T-pose on a different model.
+  character.updateMatrixWorld(true);
+  const relaxArm=(upper,lower,side)=>{
+   if(!upper||!lower)return;
+   upper.updateWorldMatrix(true,false);lower.updateWorldMatrix(true,false);
+   const upperAt=new THREE.Vector3(),lowerAt=new THREE.Vector3();
+   upper.getWorldPosition(upperAt);lower.getWorldPosition(lowerAt);
+   const from=lowerAt.sub(upperAt).normalize();
+   const outward=Math.sign(from.x)||(side==='left'?1:-1);
+   const target=new THREE.Vector3(outward*.23,-.97,.08).normalize();
+   const correction=new THREE.Quaternion().setFromUnitVectors(from,target);
+   const world=new THREE.Quaternion();upper.getWorldQuaternion(world);
+   const parent=new THREE.Quaternion();upper.parent.getWorldQuaternion(parent);
+   const local=parent.invert().multiply(correction.multiply(world));
+   upper.quaternion.copy(local);upper.updateMatrixWorld(true);
+  };
+  relaxArm(leftArm,leftForearm,'left');relaxArm(rightArm,rightForearm,'right');
+ }else{
+  // Preserve the squirrel's existing arm rest pose.
+  if(leftArm)leftArm.rotation.z+=1.08;
+  if(rightArm)rightArm.rotation.z-=1.08;
+  if(leftForearm)leftForearm.rotation.z+=.12;
+  if(rightForearm)rightForearm.rotation.z-=.12;
+ }
  for(const name of ['leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm','leftShoulder','rightShoulder','leftHand','rightHand','chest','upperChest']){
   const b=await bone(name);if(b)rigBones[name]={bone:b,rest:b.quaternion.clone(),maxAngle:name.includes('LowerArm')?1.65:name.includes('UpperArm')?1.30:.35};
  }
@@ -298,6 +340,20 @@ async function bindAvatar(gltf,kind){
   }
   animeMorphBindings=mapping;
  }
+ // Construct a compact direct-write table once per avatar switch, not every frame.
+ const pairs=new Map();
+ const register=(mesh,index,key,weight=1)=>{
+  if(!mesh?.morphTargetInfluences||index>=mesh.morphTargetInfluences.length||index<0)return;
+  let byIndex=pairs.get(mesh);if(!byIndex){byIndex=new Map();pairs.set(mesh,byIndex)}
+  let entry=byIndex.get(index);if(!entry){entry={mesh,index,channels:[]};byIndex.set(index,entry)}
+  entry.channels.push({key,weight});
+ };
+ if(kind==='squirrel'){
+  for(const mesh of morphMeshes)for(const [key,index] of exprDrivePairs)register(mesh,index,key);
+ }else if(animeMorphBindings){
+  for(const [key,items] of Object.entries(animeMorphBindings))for(const item of items)register(item.mesh,item.index,key,item.weight);
+ }
+ morphTracks=[...pairs.values()].flatMap(map=>[...map.values()]);
  character.updateMatrixWorld(true);
  const box=new THREE.Box3().setFromObject(character),size=box.getSize(new THREE.Vector3()),center=box.getCenter(new THREE.Vector3());
  if(size.y<.01)throw Error('모델 크기를 읽을 수 없습니다.');
@@ -306,7 +362,9 @@ async function bindAvatar(gltf,kind){
  const neckBone=await bone('neck'),chestBone=await bone('chest');
  const chestPos=new THREE.Vector3();if(chestBone)chestBone.getWorldPosition(chestPos);else chestPos.set(headPos.x,headPos.y-size.y*.22,headPos.z);
  const headToChest=Math.max(.12,headPos.y-chestPos.y);
- framing={height:size.y,width:size.x,centerX:headPos.x,faceZ:headPos.z,headY:headPos.y,chestY:chestPos.y,headToChest,kind,focusY:headPos.y-headToChest*.82};
+ framing={height:size.y,width:size.x,centerX:headPos.x,faceZ:headPos.z,headY:headPos.y,chestY:chestPos.y,headToChest,kind,
+  // Keep the squirrel exactly at its pre-v18 full-height camera anchor.
+  focusY:kind==='squirrel'?box.min.y+size.y*.735:headPos.y-headToChest*.82};
  camera.position.set(framing.centerX,framing.focusY,framing.faceZ+5);
  camera.lookAt(framing.centerX,framing.focusY,framing.faceZ);
  configureCamera();
@@ -316,7 +374,8 @@ async function bindAvatar(gltf,kind){
 async function model(){
  try{
   renderer=new THREE.WebGLRenderer({canvas,antialias:false,alpha:true,powerPreference:'high-performance'});
-  renderer.setPixelRatio(Math.min(devicePixelRatio||1,1.0));renderer.outputColorSpace=THREE.SRGBColorSpace;
+  // Native device detail where possible; cap drawing buffer at FHD (landscape/portrait).
+  renderer.setPixelRatio(1);renderer.outputColorSpace=THREE.SRGBColorSpace;
   scene=new THREE.Scene();scene.add(new THREE.HemisphereLight(0xffffff,0xa0b0cf,2.0));
   const light=new THREE.DirectionalLight(0xffffff,2.2);light.position.set(-2,5,5);scene.add(light);
   camera=new THREE.OrthographicCamera(-1,1,1,-1,.05,100);camera.position.set(0,1.4,5);camera.lookAt(0,1.22,0);
@@ -329,40 +388,49 @@ async function model(){
 function configureCamera(){
  if(!camera||!framing)return;
  const w=Math.max(1,canvas.clientWidth),h=Math.max(1,canvas.clientHeight),aspect=w/h;
- // Desktop: face, shoulders and upper belly. Portrait: prioritize face/shoulder width.
  const isPortrait=aspect<.8;
- // Portrait crops sides rather than zooming out to fit the full spread of arms.
- // Upper-bust framing is anchored to the measured head/chest bones.
- const viewHeight=framing.kind==='anime'
-   ? Math.max(framing.headToChest*(isPortrait?2.65:2.48),framing.height*(isPortrait?.44:.41))
-   : Math.max(framing.headToChest*(isPortrait?2.9:2.75),framing.height*(isPortrait?.64:.53));
+ let viewHeight,focusY;
+ if(framing.kind==='squirrel'){
+  // Restored exactly from the original v12/v17 squirrel framing, isolated from the human.
+  const desiredHeight=isPortrait?framing.height*.79:framing.height*.61;
+  const shoulderWidth=framing.width*(isPortrait?.86:.79);
+  viewHeight=Math.max(desiredHeight,shoulderWidth/Math.max(.25,aspect)*1.12);
+  focusY=framing.focusY+(isPortrait?.075:0)*framing.height;
+ }else{
+  // Bigger face/upper bust than v18, with a higher camera aim so the avatar
+  // appears a little LOWER in the viewport. No full-body sizing or arm-driven zoom.
+  viewHeight=Math.max(framing.headToChest*(isPortrait?2.10:1.94),framing.height*(isPortrait?.355:.325));
+  focusY=framing.focusY+framing.headToChest*(isPortrait?.24:.19);
+ }
  const halfH=viewHeight*.5,halfW=halfH*aspect;
  camera.left=-halfW;camera.right=halfW;camera.top=halfH;camera.bottom=-halfH;
- // Shift framing slightly upward for small portrait screens (head stays dominant).
- const focusY=framing.focusY+(isPortrait?.10:.02)*framing.headToChest;
  camera.position.set(framing.centerX,focusY,framing.faceZ+5);
  camera.lookAt(framing.centerX,focusY,framing.faceZ);
  camera.updateProjectionMatrix();
 }
 function draw(ts){requestAnimationFrame(draw);if(document.hidden||!renderer||!camera)return;
- frameAt=ts;fpsFrames++;if(ts-fpsAt>1200){const measured=Math.round(fpsFrames*1000/Math.max(1,ts-fpsAt));const fpsEl=el('fps');if(fpsEl)fpsEl.textContent=`${measured} fps`;if(live){if(measured<43){slowFpsWindows++;fastFpsWindows=0}else if(measured>55){fastFpsWindows++;slowFpsWindows=0}else{slowFpsWindows=0;fastFpsWindows=0}if(slowFpsWindows>=3&&renderScale>.70){renderScale=Math.max(.70,renderScale-.10);renderer.setPixelRatio(renderScale);lastWidth=0;slowFpsWindows=0}if(fastFpsWindows>=8&&renderScale<1){renderScale=Math.min(1,renderScale+.1);renderer.setPixelRatio(renderScale);lastWidth=0;fastFpsWindows=0}}fpsFrames=0;fpsAt=ts;}
+ frameAt=ts;fpsFrames++;
+ if(ts-fpsAt>1200){const measured=Math.round(fpsFrames*1000/Math.max(1,ts-fpsAt));const fpsEl=el('fps');if(fpsEl)fpsEl.textContent=`${measured} fps`;fpsFrames=0;fpsAt=ts;}
  const w=canvas.clientWidth,h=canvas.clientHeight;
- if(w&&h&&(w!==lastWidth||h!==lastHeight)){lastWidth=w;lastHeight=h;renderer.setSize(w,h,false);configureCamera()}
+ if(w&&h&&(w!==lastWidth||h!==lastHeight||lastDpr!==window.devicePixelRatio)){
+  lastDpr=window.devicePixelRatio;
+  lastWidth=w;lastHeight=h;
+  const landscape=w>=h,limitW=landscape?1920:1080,limitH=landscape?1080:1920;
+  const ratio=Math.min(window.devicePixelRatio||1,2,limitW/w,limitH/h);
+  renderer.setPixelRatio(Math.max(.25,ratio));
+  renderer.setSize(w,h,false);configureCamera();
+ }
  if(demo&&!live){const t=(ts-demoStart)*.001;reset();const phase=(Math.floor(t/2.7)%6);const s=Math.sin(t*3.0);if(phase===0){target.joy=.85;target.a=Math.max(0,s)*.45}else if(phase===1){target.angry=.9;target.e=.3}else if(phase===2){target.sorrow=.9;target.o=.3}else if(phase===3){target.fun=.9;target.a=Math.max(0,s)*.95}else if(phase===4){target.i=.85;target.u=.25}else{target.a=.9;target.o=.1}target.blink_l=Math.pow(Math.max(0,Math.sin(t*2.3)),25);target.blink_r=target.blink_l;target.yaw=Math.sin(t*.8)*.17;target.roll=Math.sin(t*.95)*.1}
  if(temporaryEmotion){reset();target[temporaryEmotion]=.92;if(ts>emotionUntil){temporaryEmotion=null;reset();status('캐릭터 준비 완료')}}
  const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;
- for(const key in target){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))} 
- // Update only the morph targets we actually drive, not every morph in the whole model.
- for(const [mesh,index] of activeMorphs)mesh.morphTargetInfluences[index]=0;
- activeMorphs.length=0;
- if(selectedAvatar==='squirrel'){
-  for(const mesh of morphMeshes){const a=mesh.morphTargetInfluences;
-   for(const [key,index] of Object.entries(exprTargets))if(index<a.length){a[index]=Math.max(0,Math.min(1,current[key]));activeMorphs.push([mesh,index]);}}
- }else if(animeMorphBindings){
-  for(const [key,items] of Object.entries(animeMorphBindings)){
-   const value=key==='blink'?Math.max(current.blink_l,current.blink_r):current[key]||0;
-   for(const it of items){it.mesh.morphTargetInfluences[it.index]=Math.max(0,Math.min(1,value*it.weight));activeMorphs.push([it.mesh,it.index]);}
-  }
+ // Time-correct smoothing keeps the same feel at 30/60/120Hz.
+ for(const key of expressionKeys){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))}
+ // Direct-write the cached mesh/morph pairs. No per-frame Map/Object.entries or push/clear.
+ for(const track of morphTracks){
+  let value=0;
+  for(const c of track.channels){const v=c.key==='blink'?Math.max(current.blink_l,current.blink_r):(current[c.key]||0);value+=v*c.weight}
+  value=clamp(value);
+  if(Math.abs(track.mesh.morphTargetInfluences[track.index]-value)>0.0001)track.mesh.morphTargetInfluences[track.index]=value;
  }
  if(headBone){const rest=headBone.userData.restRot;headBone.rotation.set(rest.x+current.pitch*.23,rest.y+current.yaw*.30,rest.z-current.roll*.25)}
  updatePoseAnimation(ts);
@@ -498,8 +566,8 @@ function aimBone(entry,nextBone,dx,dy,dz,alpha){
  const desiredLocal=parentQuat.invert().multiply(desiredWorld);
  // Anatomically conservative angular cone around the relaxed rest pose.
  const maxAngle=entry.maxAngle||1.25;
- const delta=entry.rest.clone().invert().multiply(desiredLocal);
- const angle=2*Math.acos(clamp(Math.abs(delta.w),0,1));
+ aimDeltaQ.copy(entry.rest).invert().multiply(desiredLocal);
+ const angle=2*Math.acos(clamp(Math.abs(aimDeltaQ.w),0,1));
  if(angle>maxAngle){desiredLocal.copy(entry.rest).slerp(desiredLocal,maxAngle/angle)}
  bone.quaternion.slerp(desiredLocal,alpha);
  bone.updateMatrixWorld(true);
@@ -516,13 +584,15 @@ function updatePoseAnimation(ts){
  const active=live && (ts-poseGoodAt<800);poseBlend=smoothing(poseBlend,active?1:0,active?.24:.11);
  if(!active){armTarget=0;if(bodyDetected&&ts-poseGoodAt>1300){bodyDetected=false;el('poseStatus').textContent='팔·어깨를 카메라에 보여 주세요'}}
  // Camera remains fixed as arms move. No dynamic zoom or recentering.
- for(const key of ['chest','upperChest']){
+ if(active)poseLeanQ.setFromEuler(poseEuler.set(0,0,(poseInfo.lean+poseInfo.waist)*.20*poseBlend));
+ for(const key of torsoKeys){
   const entry=rigBones[key];if(!entry)continue;
-  const q=entry.rest.clone();if(active){q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(0,0,(poseInfo.lean+poseInfo.waist)*.20*poseBlend)));}
-  entry.bone.quaternion.slerp(q,.18);
+  poseChestQ.copy(entry.rest);
+  if(active)poseChestQ.multiply(poseLeanQ);
+  entry.bone.quaternion.slerp(poseChestQ,.18);
  }
  character.updateMatrixWorld(true);
- for(const side of ['left','right']){
+ for(const side of poseSides){
   const shoulderEntry=rigBones[side+'Shoulder'];
   const upper=rigBones[side+'UpperArm'],lower=rigBones[side+'LowerArm'];
   const palm=rigBones[side+'Hand'];const marks=poseInfo[side];
@@ -530,8 +600,8 @@ function updatePoseAnimation(ts){
    const [shoulder,elbow,wrist]=marks;
    if(shoulderEntry){
     const lift=clamp((shoulder.y-elbow.y)*1.3,0,1);
-    const q=shoulderEntry.rest.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(0,0,(side==='left'?1:-1)*lift*.12)));
-    shoulderEntry.bone.quaternion.slerp(q,.2*poseBlend);
+    poseShoulderQ.copy(shoulderEntry.rest).multiply(poseShoulderDelta.setFromEuler(poseEuler.set(0,0,(side==='left'?1:-1)*lift*.12)));
+    shoulderEntry.bone.quaternion.slerp(poseShoulderQ,.2*poseBlend);
     shoulderEntry.bone.updateMatrixWorld(true);
    }
    const first=segmentDirection(shoulder,elbow),second=segmentDirection(elbow,wrist);
