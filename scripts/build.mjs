@@ -9,7 +9,7 @@ const mkdir = p => fs.mkdirSync(p,{recursive:true});
 const cp = (a,b) => { mkdir(path.dirname(b)); fs.copyFileSync(a,b); };
 const copyTree = (a,b) => { if(!fs.existsSync(a))throw Error('Missing npm package: '+a);fs.cpSync(a,b,{recursive:true});};
 const required = [
-  ['index.html','index.html'],['main.js','main.js'],['inference-worker.js','inference-worker.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
+  ['index.html','index.html'],['ASSET_LICENSES.md','ASSET_LICENSES.md'],['main.js','main.js'],['inference-worker.js','inference-worker.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
   ['node_modules/three/build/three.module.js','vendor/three/build/three.module.js'],
   ['node_modules/@mediapipe/tasks-vision/vision_bundle.mjs','vendor/mediapipe/vision_bundle.mjs']
 ];
@@ -32,11 +32,11 @@ function get(url, target, redirects=0) { return new Promise((resolve,reject)=>{
   file.on('error',reject);
  });request.on('timeout',()=>request.destroy(Error('Download timed out: '+url)));request.on('error',reject);
 }); }
-// User-provided VRoid beta HairSample_Female VRM, CC0 per official VRoid FAQ.
+// User-provided VRoid AvatarSample_A VRM, VRoidPreset_A-Z terms; NOT CC0.
 // Bundle it locally: no dependency on a third-party GitHub download during build.
 const animeFile=path.join(root,'assets/anime-female.vrm');
-if(!fs.existsSync(animeFile))throw Error('Required bundled CC0 avatar missing: assets/anime-female.vrm');
-if(fs.statSync(animeFile).size<500000)throw Error('CC0 avatar unexpectedly small');
+if(!fs.existsSync(animeFile))throw Error('Required bundled VRoid avatar missing: assets/anime-female.vrm');
+if(fs.statSync(animeFile).size<500000)throw Error('VRoid avatar unexpectedly small');
 cp(animeFile,path.join(dist,'assets/anime-female.vrm'));
 const models = [
  ['face_landmarker.task','https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',1000000],

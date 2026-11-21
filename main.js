@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const el=id=>document.getElementById(id), canvas=el('three'), video=el('video');
-// One Three.js renderer and one MediaPipe tracker are shared by both CC0 VRM models.
+// One Three.js renderer and one MediaPipe tracker are shared by both VRM models.
 // The larger human model loads only when requested in settings.
 let selectedAvatar='squirrel',animeModelPromise=null,avatarSwitchToken=0;
 const settings=el('characterSettings');
@@ -22,8 +22,8 @@ async function switchAvatar(name){
    if(token!==avatarSwitchToken)return;
    await bindAvatar(gltf,'anime');
    selectedAvatar='anime';
-   el('characterLabel').textContent='Anime · HairSample Female';
-   el('licenseNotice').textContent='사람형: VRoid HairSample_Female · CC0';
+   el('characterLabel').textContent='Anime · AvatarSample A';
+   el('licenseNotice').textContent='사람형: VRoid AvatarSample_A · 공식 무료 이용약관 (CC0 아님)';
    msg.textContent='사람형 캐릭터 선택 완료 · 얼굴·팔 추적 공유';
   }else{
    if(!squirrelScene)throw Error('다람쥐 모델이 아직 준비되지 않았습니다.');
@@ -85,6 +85,13 @@ async function initInferenceWorker(){
    } else if(data.type==='error'){
     workerFrameInFlight=false;
     if(!settled){fail(Error(data.message||'Worker initialization error'));return}
+    // A failed Pose init must not silently leave the second avatar motionless.
+    if(String(data.message||'').startsWith('Pose optional:')){
+     el('poseStatus').textContent='팔 AI 재연결 중';
+     console.warn('Worker pose unavailable; retrying the standard tracker',data.message);
+     useMainInferenceFallback();
+     return;
+    }
     if(++workerErrors>5){console.warn('Worker failed, switching to CPU fallback',data.message);useMainInferenceFallback()}
    }
   };
@@ -254,7 +261,7 @@ el('full').onclick=async()=>{try{if(document.fullscreenElement)await document.ex
 
 async function bindAvatar(gltf,kind){
  if(character)scene.remove(character);
- character=gltf.scene;scene.add(character);
+ character=gltf.scene;scene.add(character);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;
  morphMeshes=[];headBone=null;animeMorphBindings=null;activeMorphs=[];
  for(const key of Object.keys(rigBones))delete rigBones[key];
  character.traverse(o=>{if(o.isMesh&&o.morphTargetInfluences?.length){morphMeshes.push(o);o.frustumCulled=false;}if(o.isSkinnedMesh)o.frustumCulled=false;});
@@ -295,7 +302,11 @@ async function bindAvatar(gltf,kind){
  const box=new THREE.Box3().setFromObject(character),size=box.getSize(new THREE.Vector3()),center=box.getCenter(new THREE.Vector3());
  if(size.y<.01)throw Error('모델 크기를 읽을 수 없습니다.');
  const headPos=new THREE.Vector3();if(headBone)headBone.getWorldPosition(headPos);else headPos.set(center.x,box.min.y+size.y*.79,center.z);
- framing={height:size.y,width:size.x,centerX:headPos.x,faceZ:headPos.z,focusY:box.min.y+size.y*.735};
+ // Center on actual face rather than full-body bounding box (long hair inflates width).
+ const neckBone=await bone('neck'),chestBone=await bone('chest');
+ const chestPos=new THREE.Vector3();if(chestBone)chestBone.getWorldPosition(chestPos);else chestPos.set(headPos.x,headPos.y-size.y*.22,headPos.z);
+ const headToChest=Math.max(.12,headPos.y-chestPos.y);
+ framing={height:size.y,width:size.x,centerX:headPos.x,faceZ:headPos.z,headY:headPos.y,chestY:chestPos.y,headToChest,kind,focusY:headPos.y-headToChest*.82};
  camera.position.set(framing.centerX,framing.focusY,framing.faceZ+5);
  camera.lookAt(framing.centerX,framing.focusY,framing.faceZ);
  configureCamera();
@@ -320,13 +331,15 @@ function configureCamera(){
  const w=Math.max(1,canvas.clientWidth),h=Math.max(1,canvas.clientHeight),aspect=w/h;
  // Desktop: face, shoulders and upper belly. Portrait: prioritize face/shoulder width.
  const isPortrait=aspect<.8;
- const desiredHeight=isPortrait ? framing.height*.79 : framing.height*.61;
- const shoulderWidth=framing.width*(isPortrait?.86:.79);
- const viewHeight=Math.max(desiredHeight,shoulderWidth/Math.max(.25,aspect)*1.12);
+ // Portrait crops sides rather than zooming out to fit the full spread of arms.
+ // Upper-bust framing is anchored to the measured head/chest bones.
+ const viewHeight=framing.kind==='anime'
+   ? Math.max(framing.headToChest*(isPortrait?2.65:2.48),framing.height*(isPortrait?.44:.41))
+   : Math.max(framing.headToChest*(isPortrait?2.9:2.75),framing.height*(isPortrait?.64:.53));
  const halfH=viewHeight*.5,halfW=halfH*aspect;
  camera.left=-halfW;camera.right=halfW;camera.top=halfH;camera.bottom=-halfH;
  // Shift framing slightly upward for small portrait screens (head stays dominant).
- const focusY=framing.focusY+(isPortrait?.075:0)*framing.height;
+ const focusY=framing.focusY+(isPortrait?.10:.02)*framing.headToChest;
  camera.position.set(framing.centerX,focusY,framing.faceZ+5);
  camera.lookAt(framing.centerX,focusY,framing.faceZ);
  camera.updateProjectionMatrix();
@@ -493,7 +506,7 @@ function aimBone(entry,nextBone,dx,dy,dz,alpha){
 }
 function segmentDirection(p,q){
  // MediaPipe input is unmirrored, while the visitor sees a mirrored selfie.
- // Camera preview is mirrored; world X increases with the visible selfie direction.
+ // Render canvas is mirrored in CSS to match the mirrored webcam preview.
  const dx=(q.x-p.x),dy=-(q.y-p.y),dz=clamp((p.z-q.z)*.34,-.32,.32);
  const norm=Math.hypot(dx,dy,dz)||1;
  return [dx/norm,dy/norm,dz/norm];
@@ -510,16 +523,23 @@ function updatePoseAnimation(ts){
  }
  character.updateMatrixWorld(true);
  for(const side of ['left','right']){
+  const shoulderEntry=rigBones[side+'Shoulder'];
   const upper=rigBones[side+'UpperArm'],lower=rigBones[side+'LowerArm'];
   const palm=rigBones[side+'Hand'];const marks=poseInfo[side];
   if(active&&marks.length===3&&upper&&lower&&palm){
    const [shoulder,elbow,wrist]=marks;
+   if(shoulderEntry){
+    const lift=clamp((shoulder.y-elbow.y)*1.3,0,1);
+    const q=shoulderEntry.rest.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(0,0,(side==='left'?1:-1)*lift*.12)));
+    shoulderEntry.bone.quaternion.slerp(q,.2*poseBlend);
+    shoulderEntry.bone.updateMatrixWorld(true);
+   }
    const first=segmentDirection(shoulder,elbow),second=segmentDirection(elbow,wrist);
    // The model faces +Z after rotation and image x is screen x. Child vectors supply anatomical sign.
    aimBone(upper,lower.bone,...first,.32*poseBlend);
    aimBone(lower,palm.bone,...second,.33*poseBlend);
   }else{
-   for(const entry of [upper,lower])if(entry)entry.bone.quaternion.slerp(entry.rest,.11);
+   for(const entry of [shoulderEntry,upper,lower])if(entry)entry.bone.quaternion.slerp(entry.rest,.11);
   }
   if(upper)upper.bone.updateMatrixWorld(true);
  }
