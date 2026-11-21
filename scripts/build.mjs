@@ -51,5 +51,6 @@ const html=fs.readFileSync(path.join(dist,'index.html'),'utf8');
 const js=fs.readFileSync(path.join(dist,'main.js'),'utf8');
 if (/cdn\.jsdelivr|unpkg\.com|storage\.googleapis/.test(html+js))throw Error('Runtime still refers to remote assets');
 const files=fs.readdirSync(path.join(dist,'vendor/mediapipe/wasm'));
-if (!files.some(f=>f.endsWith('.wasm')))throw Error('MediaPipe WASM missing');
+if (!files.some(f=>f.endsWith('.wasm')) || !files.some(f=>f.endsWith('.js')))throw Error('MediaPipe WASM or loader missing');
+for(const requiredFile of ['index.html','main.js','assets/mr-squirrel.vrm','vendor/mediapipe/vision_bundle.mjs','vendor/three/build/three.module.js','models/face_landmarker.task','models/pose_landmarker_lite.task']){ if(!fs.existsSync(path.join(dist,requiredFile))) throw Error('Missing deployment asset: '+requiredFile); }
 console.log('Self-hosted site ready:',dist,'WASM files:',files.length);
