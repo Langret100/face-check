@@ -52,7 +52,7 @@ el('full').onclick=async()=>{try{if(document.fullscreenElement)await document.ex
 async function model(){
  try{
   renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true,powerPreference:'high-performance'});
-  renderer.setPixelRatio(Math.min(devicePixelRatio||1,1.15));renderer.outputColorSpace=THREE.SRGBColorSpace;
+  renderer.setPixelRatio(Math.min(devicePixelRatio||1,1.0));renderer.outputColorSpace=THREE.SRGBColorSpace;
   scene=new THREE.Scene();scene.add(new THREE.HemisphereLight(0xffffff,0xa0b0cf,2.0));
   const light=new THREE.DirectionalLight(0xffffff,2.2);light.position.set(-2,5,5);scene.add(light);
   camera=new THREE.OrthographicCamera(-1,1,1,-1,.05,100);camera.position.set(0,1.4,5);camera.lookAt(0,1.22,0);
@@ -146,6 +146,20 @@ function detect(ts){if(!landmarker||video.readyState<2||video.currentTime===last
  }catch(e){if(++errorCount>=10){stop();err('표정 분석이 반복 실패했습니다: '+(e?.message||e))}}
 }
 
+// Self-hosted MediaPipe: no runtime jsDelivr, unpkg or Google Storage dependency.
+// GitHub Actions downloads official binaries during BUILD, then publishes everything together.
+let visionRuntimePromise=null;
+async function loadVisionRuntime(){
+ if(visionRuntimePromise)return visionRuntimePromise;
+ visionRuntimePromise=(async()=>{
+  const lib=await import('./vendor/mediapipe/vision_bundle.mjs');
+  if(!lib.FilesetResolver||!lib.FaceLandmarker||!lib.PoseLandmarker)throw Error('로컬 AI 라이브러리 API 누락');
+  const wasm=await lib.FilesetResolver.forVisionTasks('./vendor/mediapipe/wasm');
+  return {lib,wasm};
+ })();
+ try{return await visionRuntimePromise}catch(e){visionRuntimePromise=null;throw Error('로컬 AI 파일을 불러오지 못했습니다. GitHub Actions 빌드 결과를 확인하세요: '+(e?.message||e))}
+}
+
 // MediaPipe Pose supplies 33 landmarks. Shoulder/elbow/wrist are 11/13/15 and 12/14/16.
 // All skeletal work happens in memory, never sends frames to a custom server.
 async function getPoseLandmarker(){
@@ -153,9 +167,8 @@ async function getPoseLandmarker(){
  if(poseLoading)return null;
  poseLoading=true;
  try{
-  const {PoseLandmarker,FilesetResolver}=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');
-  const wasm=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
-  poseLandmarker=await PoseLandmarker.createFromOptions(wasm,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:.52,minPosePresenceConfidence:.5,minTrackingConfidence:.5,outputSegmentationMasks:false});
+  const {lib:{PoseLandmarker},wasm}=await loadVisionRuntime();
+  poseLandmarker=await PoseLandmarker.createFromOptions(wasm,{baseOptions:{modelAssetPath:'./models/pose_landmarker_lite.task',delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:.52,minPosePresenceConfidence:.5,minTrackingConfidence:.5,outputSegmentationMasks:false});
   poseErrors=0;el('poseStatus').textContent='몸동작 인식 준비 완료';return poseLandmarker;
  }catch(e){console.warn('Body tracking optional:',e);el('poseStatus').textContent='몸동작 모델을 불러오지 못했어요';return null}
  finally{poseLoading=false}
@@ -253,14 +266,22 @@ function updatePoseAnimation(ts){
  }
 }
 
-async function getLandmarker(){if(landmarker)return landmarker;const {FaceLandmarker,FilesetResolver}=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');const wasm=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');landmarker=await FaceLandmarker.createFromOptions(wasm,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:'CPU'},runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:true});return landmarker}
+async function getLandmarker(){
+ if(landmarker)return landmarker;
+ const {lib:{FaceLandmarker},wasm}=await loadVisionRuntime();
+ landmarker=await FaceLandmarker.createFromOptions(wasm,{
+  baseOptions:{modelAssetPath:'./models/face_landmarker.task',delegate:'CPU'},
+  runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:true
+ });
+ return landmarker;
+}
 async function startCamera(){if(!modelReady||autoStarting||live)return;autoStarting=true;stop();clearErr();const token=++session;el('retry').hidden=true;el('stop').disabled=false;status('카메라 연결 중');hint('웹캠 권한을 허용해 주세요');try{
  if(!navigator.mediaDevices?.getUserMedia)throw Error('카메라는 HTTPS 또는 localhost에서만 사용 가능합니다.');
- const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:30}},audio:false});if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');status('AI 모델 준비 중');hint('첫 연결에는 얼굴 인식 모델 다운로드가 필요합니다');await getLandmarker();if(token!==session)return;
+ const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:30}},audio:false});if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');await getLandmarker();if(token!==session)return;
  // Pose is optional and starts in parallel; a failed pose download must not block face tracking.
  getPoseLandmarker().catch(e=>console.warn('Pose unavailable:',e));
  live=true;demo=false;lastVideoTime=-1;lastDetection=0;poseLastVideoTime=-1;poseLastDetection=0;errorCount=0;hadFace=false;status('실시간 표정 인식 중');hint('웃거나 팔을 들어 보세요!');s.getVideoTracks()[0]?.addEventListener('ended',()=>{if(token===session){stop();err('카메라 연결이 종료됐습니다.')}});
- }catch(e){if(token===session){stop();err('카메라 연결 실패: '+(e?.message||e));hint('카메라 허용 후 재연결을 눌러 주세요')}}finally{autoStarting=false}}
+ }catch(e){if(token===session){stop();err('카메라 연결 실패: '+(e?.message||e));hint('AI 인식 파일 로딩에 실패했어요. 페이지를 새로 고침해 주세요')}}finally{autoStarting=false}}
 el('retry').onclick=startCamera;
 el('voice').onclick=()=>{voiceState.enabled=!voiceState.enabled;el('voice').textContent=voiceState.enabled?'🔊 목소리 켜짐':'🔇 목소리 꺼짐';if(!voiceState.enabled)clearVoice();else{try{speechSynthesis.getVoices()}catch(e){}}};
 window.addEventListener('pointerdown',()=>{if(voiceState.enabled&&'speechSynthesis' in window){speechSynthesis.resume()}},{passive:true});
