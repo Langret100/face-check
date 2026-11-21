@@ -399,8 +399,11 @@ function configureCamera(){
  }else{
   // Bigger face/upper bust than v18, with a higher camera aim so the avatar
   // appears a little LOWER in the viewport. No full-body sizing or arm-driven zoom.
-  viewHeight=Math.max(framing.headToChest*(isPortrait?2.10:1.94),framing.height*(isPortrait?.355:.325));
-  focusY=framing.focusY+framing.headToChest*(isPortrait?.24:.19);
+  // Human-only portrait: about 8% tighter than v20. Raising the aim point
+  // shifts the avatar DOWN on screen so the hair is clear of the top edge.
+  // The squirrel branch above remains pixel-for-pixel unchanged.
+  viewHeight=Math.max(framing.headToChest*(isPortrait?1.94:1.79),framing.height*(isPortrait?.328:.300));
+  focusY=framing.focusY+framing.headToChest*(isPortrait?.57:.53);
  }
  const halfH=viewHeight*.5,halfW=halfH*aspect;
  camera.left=-halfW;camera.right=halfW;camera.top=halfH;camera.bottom=-halfH;
