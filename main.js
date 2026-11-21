@@ -423,7 +423,7 @@ function configureCamera(){
   // shifts the avatar DOWN on screen so the hair is clear of the top edge.
   // The squirrel branch above remains pixel-for-pixel unchanged.
   viewHeight=Math.max(framing.headToChest*(isPortrait?1.94:1.79),framing.height*(isPortrait?.328:.300));
-  focusY=framing.focusY+framing.headToChest*(isPortrait?.57:.53);
+  focusY=framing.focusY+framing.headToChest*(isPortrait?.68:.64);
  }
  const halfH=viewHeight*.5,halfW=halfH*aspect;
  camera.left=-halfW;camera.right=halfW;camera.top=halfH;camera.bottom=-halfH;
