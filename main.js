@@ -5,7 +5,7 @@ const el=id=>document.getElementById(id), canvas=el('three'), video=el('video');
 const neutral={a:0,i:0,u:0,e:0,o:0,blink_l:0,blink_r:0,joy:0,angry:0,sorrow:0,fun:0,yaw:0,pitch:0,roll:0};
 const target={...neutral},current={...neutral};
 const exprTargets={a:11,i:9,u:7,e:10,o:8,blink_l:1,blink_r:0,joy:5,angry:4,sorrow:3,fun:6};
-let frameAt=0,lastWidth=0,lastHeight=0,autoStarting=false;
+let frameAt=0,lastWidth=0,lastHeight=0,autoStarting=false,inferTurn=0;let fpsFrames=0,fpsAt=0;
 // Independent body tracking, decoupled from face detection so face/TTS still work on pose failure.
 let poseLandmarker=null,poseLoading=false,poseLastDetection=0,poseLastVideoTime=-1,poseErrors=0;
 let poseGoodAt=-10000,armActivity=0,armTarget=0,bodyDetected=false;
@@ -16,20 +16,21 @@ const poseInfo={left:[],right:[],waist:0,lean:0};
 const poseSmooth={left:[],right:[]};
 let poseBlend=0, lastPoseFrame=0;
 const smoothing=(a,b,k)=>a+(b-a)*k;
-// Low-latency phrase echo: 280ms end-of-speech hold; local temporary memory only.
+// Low-latency phrase echo: 170ms end-of-speech hold; local temporary memory only.
 // Avoid open-speaker live monitor: it causes acoustic feedback in a public exhibit.
 // Never send voice data over the network. A tap is required to request permission.
-const echo={enabled:false,stream:null,ctx:null,analyser:null,data:null,recorder:null,chunks:[],speaking:false,startedAt:0,quietAt:0,playing:false,source:null,raf:0,cooldown:0,serial:0};
+const echo={enabled:false,starting:false,stream:null,ctx:null,analyser:null,data:null,recorder:null,chunks:[],speaking:false,startedAt:0,quietAt:0,playing:false,source:null,raf:0,cooldown:0,serial:0};
 async function stopEcho(){
  ++echo.serial; echo.enabled=false;echo.chunks.length=0;echo.data=null;echo.analyser=null;cancelAnimationFrame(echo.raf);if(echo.recorder&&echo.recorder.state!=='inactive'){echo.recorder.onstop=null;try{echo.recorder.stop()}catch{}}
  try{echo.source?.stop()}catch{};if(echo.source){try{echo.source.disconnect()}catch{};echo.source.buffer=null;}echo.source=null;echo.stream?.getTracks().forEach(t=>t.stop());echo.stream=null;
  try{await echo.ctx?.close()}catch{};echo.ctx=null;echo.recorder=null;echo.speaking=false;echo.playing=false;
- const b=el('echo');if(b)b.textContent='🎤 말 따라하기 켜기';
+ const b=el('echo');if(b)b.textContent='🎤 마이크 켜기';
 }
 async function toggleEcho(){
+ if(echo.starting)return;
  if(echo.enabled){await stopEcho();return;}
  if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){err('이 브라우저에서는 마이크 녹음을 지원하지 않습니다.');return;}
- const token=++echo.serial;
+ const token=++echo.serial;echo.starting=true;el('echo').textContent='🎤 마이크 권한 확인 중';
  try{
   const microphone=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
   if(token!==echo.serial){microphone.getTracks().forEach(t=>t.stop());return;}
@@ -39,7 +40,8 @@ async function toggleEcho(){
   try{speechSynthesis.cancel();el('voiceBubble').hidden=true;}catch{}
   el('echo').textContent='🎤 말 따라하기 끄기';clearErr();echo.raf=requestAnimationFrame(monitorEcho);
   microphone.getAudioTracks()[0].addEventListener('ended',()=>stopEcho());
- }catch(e){await stopEcho();err('마이크를 사용할 수 없습니다: '+(e.message||e));}
+ }catch(e){await stopEcho();el('echo').textContent='🎤 마이크 켜기';hint('마이크가 차단됐어요. 버튼을 눌러 허용해 주세요.');console.warn('마이크 자동 시작 제한:',e);}
+ finally{echo.starting=false;}
 }
 function monitorEcho(now){
  if(!echo.enabled||!echo.analyser)return;
@@ -47,7 +49,7 @@ function monitorEcho(now){
  if(echo.playing||now<echo.cooldown)return;
  echo.analyser.getByteTimeDomainData(echo.data);
  let power=0;for(const x of echo.data){const d=(x-128)/128;power+=d*d}
- const rms=Math.sqrt(power/echo.data.length),isTalking=rms>.038;
+ const rms=Math.sqrt(power/echo.data.length),isTalking=rms>.031;
  if(!echo.speaking){
   if(echo.recorder?.state==='recording'||!isTalking)return;
   echo.speaking=true;echo.startedAt=now;echo.quietAt=0;echo.chunks=[];el('echo').textContent='🔴 목소리 녹음 중';
@@ -55,12 +57,12 @@ function monitorEcho(now){
    const mime=['audio/webm;codecs=opus','audio/mp4','audio/webm'].find(x=>MediaRecorder.isTypeSupported(x));
    const rec=new MediaRecorder(echo.stream,mime?{mimeType:mime}:undefined);echo.recorder=rec;
    const recordingToken=echo.serial;rec.ondataavailable=e=>{if(e.data.size&&echo.enabled&&recordingToken===echo.serial)echo.chunks.push(e.data)};
-   rec.onstop=()=>{echo.recorder=null;if(echo.enabled&&recordingToken===echo.serial)playEcho(rec.mimeType);else echo.chunks.length=0;};rec.start(60);
+   rec.onstop=()=>{echo.recorder=null;if(echo.enabled&&recordingToken===echo.serial)playEcho(rec.mimeType);else echo.chunks.length=0;};rec.start(40);
   }catch(e){echo.speaking=false;err('음성 녹음을 시작하지 못했습니다: '+e.message)}
  }else{
   if(isTalking)echo.quietAt=0;else if(!echo.quietAt)echo.quietAt=now;
-  if((echo.quietAt&&now-echo.quietAt>280)||now-echo.startedAt>5000){
-   const duration=now-echo.startedAt;echo.speaking=false;echo.cooldown=now+600;el('echo').textContent='🔊 목소리 변조 중';
+  if((echo.quietAt&&now-echo.quietAt>170)||now-echo.startedAt>5000){
+   const duration=now-echo.startedAt;echo.speaking=false;echo.cooldown=now+200;el('echo').textContent='🔊 목소리 변조 중';
    if(echo.recorder?.state==='recording'){if(duration<260){echo.recorder.onstop=null;echo.recorder.stop();echo.chunks.length=0;}else echo.recorder.stop()}
   }
  }
@@ -74,9 +76,9 @@ async function playEcho(mime){
   if(!echo.enabled||token!==echo.serial||!echo.ctx||buffer.duration<.25||buffer.duration>7)return;
   if('speechSynthesis' in window){speechSynthesis.cancel();el('voiceBubble').hidden=true;}
   const source=echo.ctx.createBufferSource(),filter=echo.ctx.createBiquadFilter(),gain=echo.ctx.createGain();
-  source.buffer=buffer;source.playbackRate.value=1.18;filter.type='highpass';filter.frequency.value=170;gain.gain.value=.9;
-  source.connect(filter);filter.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
-  source.onended=()=>{try{source.disconnect();filter.disconnect();gain.disconnect()}catch{};source.buffer=null;if(token===echo.serial){echo.playing=false;echo.source=null;echo.cooldown=performance.now()+550;el('echo').textContent='🎤 말 따라하기 끄기'}};source.start();
+  source.buffer=buffer;source.playbackRate.value=1.46;filter.type='highpass';filter.frequency.value=310;gain.gain.value=.88;
+  const bright=echo.ctx.createBiquadFilter();bright.type='peaking';bright.frequency.value=2500;bright.Q.value=.8;bright.gain.value=5;source.connect(filter);filter.connect(bright);bright.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
+  source.onended=()=>{try{source.disconnect();filter.disconnect();bright.disconnect();gain.disconnect()}catch{};source.buffer=null;if(token===echo.serial){echo.playing=false;echo.source=null;echo.cooldown=performance.now()+300;el('echo').textContent='🎤 말 따라하기 끄기'}};source.start();
  }catch(e){console.warn('Local voice echo unavailable:',e)}finally{if(token===echo.serial&&!echo.source){echo.playing=false;echo.cooldown=performance.now()+700;el('echo').textContent='🎤 말 따라하기 끄기'}echo.chunks.length=0;}
 }
 
@@ -90,7 +92,7 @@ function voiceSay(kind){
  let line=lines.find(x=>x!==voiceState.lastSpoken)||lines[0]; if(!line)return;
  voiceState.lastSpoken=line; voiceState.lastKind=kind; voiceState.lastAt=performance.now();
  const bubble=el('voiceBubble');bubble.textContent=line;bubble.hidden=false;
- try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(line);s.lang='ko-KR';s.rate=1.08;s.pitch=1.28;s.volume=.85;
+ try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(line);s.lang='ko-KR';s.rate=1.15;s.pitch=1.6;s.volume=.85;
  const voices=speechSynthesis.getVoices();s.voice=voices.find(v=>v.lang.toLowerCase().startsWith('ko')&&v.localService)||voices.find(v=>v.lang.toLowerCase().startsWith('ko'))||null;
  s.onend=()=>{bubble.hidden=true};s.onerror=()=>{bubble.hidden=true};speechSynthesis.speak(s);
  }catch(e){hint('음성 출력이 제한되어 있어요. 화면을 한 번 눌러 주세요.')}
@@ -179,13 +181,13 @@ function configureCamera(){
  camera.updateProjectionMatrix();
 }
 function draw(ts){requestAnimationFrame(draw);if(!renderer||!camera)return;
- if(ts-frameAt<15.5)return;frameAt=ts;
+ if(ts-frameAt<15.8)return;frameAt=ts;fpsFrames++;if(ts-fpsAt>1200){const measured=Math.round(fpsFrames*1000/Math.max(1,ts-fpsAt));const fpsEl=el('fps');if(fpsEl)fpsEl.textContent=`${measured} fps`;fpsFrames=0;fpsAt=ts;}
  const w=canvas.clientWidth,h=canvas.clientHeight;
  if(w&&h&&(w!==lastWidth||h!==lastHeight)){lastWidth=w;lastHeight=h;renderer.setSize(w,h,false);configureCamera()}
  if(demo&&!live){const t=(ts-demoStart)*.001;reset();const phase=(Math.floor(t/2.7)%6);const s=Math.sin(t*3.0);if(phase===0){target.joy=.85;target.a=Math.max(0,s)*.45}else if(phase===1){target.angry=.9;target.e=.3}else if(phase===2){target.sorrow=.9;target.o=.3}else if(phase===3){target.fun=.9;target.a=Math.max(0,s)*.95}else if(phase===4){target.i=.85;target.u=.25}else{target.a=.9;target.o=.1}target.blink_l=Math.pow(Math.max(0,Math.sin(t*2.3)),25);target.blink_r=target.blink_l;target.yaw=Math.sin(t*.8)*.17;target.roll=Math.sin(t*.95)*.1}
  if(temporaryEmotion){reset();target[temporaryEmotion]=.92;if(ts>emotionUntil){temporaryEmotion=null;reset();status('캐릭터 준비 완료')}}
  const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;
- for(const key in target){const k=key.startsWith('blink')?.48:key==='yaw'||key==='roll'?.20:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.15:.27;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))} 
+ for(const key in target){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))} 
  // Apply VRM0 morph indices directly: verified against uploaded file's blendShapeGroups.
  for(const mesh of morphMeshes){const a=mesh.morphTargetInfluences;for(let i=0;i<a.length;i++)a[i]=0;
   for(const [key,index] of Object.entries(exprTargets))if(index<a.length)a[index]=Math.max(0,Math.min(1,(a[index]||0)+current[key]));
@@ -193,11 +195,11 @@ function draw(ts){requestAnimationFrame(draw);if(!renderer||!camera)return;
  if(headBone){const rest=headBone.userData.restRot;headBone.rotation.set(rest.x+current.pitch*.23,rest.y+current.yaw*.30,rest.z-current.roll*.25)}
  updatePoseAnimation(ts);
  renderer.render(scene,camera);
- if(live){detect(ts);detectPose(ts);}
+ if(live){if(inferTurn%2===0){detect(ts)}else{detectPose(ts)}inferTurn++;}
 
 }
 function score(map,name){return map[name]||0}function clamp(x,min=0,max=1){return Math.max(min,Math.min(max,x))}
-function detect(ts){if(!landmarker||video.readyState<2||video.currentTime===lastVideoTime||ts-lastDetection<65)return;lastVideoTime=video.currentTime;lastDetection=ts;
+function detect(ts){if(!landmarker||video.readyState<2||video.currentTime===lastVideoTime||ts-lastDetection<46)return;lastVideoTime=video.currentTime;lastDetection=ts;
  try{const r=landmarker.detectForVideo(video,ts);const categories=r.faceBlendshapes?.[0]?.categories||[];if(!categories.length){clearVoice();reset();if(hadFace)hint('얼굴을 카메라에 보여 주세요');hadFace=false;return}
  if(!hadFace){hadFace=true;hint('좋아요! 웃거나 눈을 감거나 입을 벌려 보세요')}const b={};for(const p of categories)b[p.categoryName]=p.score;
  reset();target.blink_l=clamp(score(b,'eyeBlinkLeft')*1.35);target.blink_r=clamp(score(b,'eyeBlinkRight')*1.35);
@@ -249,7 +251,7 @@ async function getPoseLandmarker(){
  finally{poseLoading=false}
 }
 function detectPose(ts){
- if(!poseLandmarker||video.readyState<2||video.currentTime===poseLastVideoTime||ts-poseLastDetection<90)return;
+ if(!poseLandmarker||video.readyState<2||video.currentTime===poseLastVideoTime||ts-poseLastDetection<80)return;
  poseLastVideoTime=video.currentTime;poseLastDetection=ts;
  try{
   const result=poseLandmarker.detectForVideo(video,ts);
@@ -324,14 +326,14 @@ function aimBone(entry,nextBone,dx,dy,dz,alpha){
 }
 function segmentDirection(p,q){
  // MediaPipe input is unmirrored, while the visitor sees a mirrored selfie.
- // The avatar faces the viewer (+Z), therefore reverse horizontal camera X.
- const dx=-(q.x-p.x),dy=-(q.y-p.y),dz=clamp((p.z-q.z)*.34,-.32,.32);
+ // Camera preview is mirrored; world X increases with the visible selfie direction.
+ const dx=(q.x-p.x),dy=-(q.y-p.y),dz=clamp((p.z-q.z)*.34,-.32,.32);
  const norm=Math.hypot(dx,dy,dz)||1;
  return [dx/norm,dy/norm,dz/norm];
 }
 function updatePoseAnimation(ts){
  if(!character)return;
- const active=live && (ts-poseGoodAt<800);poseBlend=smoothing(poseBlend,active?1:0,active?.14:.075);
+ const active=live && (ts-poseGoodAt<800);poseBlend=smoothing(poseBlend,active?1:0,active?.24:.11);
  if(!active){armTarget=0;if(bodyDetected&&ts-poseGoodAt>1300){bodyDetected=false;el('poseStatus').textContent='팔·어깨를 카메라에 보여 주세요'}}
  // Camera remains fixed as arms move. No dynamic zoom or recentering.
  for(const key of ['chest','upperChest']){
@@ -347,8 +349,8 @@ function updatePoseAnimation(ts){
    const [shoulder,elbow,wrist]=marks;
    const first=segmentDirection(shoulder,elbow),second=segmentDirection(elbow,wrist);
    // The model faces +Z after rotation and image x is screen x. Child vectors supply anatomical sign.
-   aimBone(upper,lower.bone,...first,.21*poseBlend);
-   aimBone(lower,palm.bone,...second,.23*poseBlend);
+   aimBone(upper,lower.bone,...first,.32*poseBlend);
+   aimBone(lower,palm.bone,...second,.33*poseBlend);
   }else{
    for(const entry of [upper,lower])if(entry)entry.bone.quaternion.slerp(entry.rest,.11);
   }
@@ -367,7 +369,7 @@ async function getLandmarker(){
 }
 async function startCamera(){if(!modelReady||autoStarting||live)return;autoStarting=true;stop();clearErr();const token=++session;el('retry').hidden=true;el('stop').disabled=false;status('카메라 연결 중');hint('웹캠 권한을 허용해 주세요');try{
  if(!navigator.mediaDevices?.getUserMedia)throw Error('카메라는 HTTPS 또는 localhost에서만 사용 가능합니다.');
- const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480},frameRate:{ideal:30}},audio:false});if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');await getLandmarker();if(token!==session)return;
+ const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:480},height:{ideal:360},frameRate:{ideal:30}},audio:false});if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');if(!echo.enabled&&!echo.starting)toggleEcho();status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');await getLandmarker();if(token!==session)return;
  // Pose is optional and starts in parallel; a failed pose download must not block face tracking.
  getPoseLandmarker().catch(e=>console.warn('Pose unavailable:',e));
  live=true;demo=false;lastVideoTime=-1;lastDetection=0;poseLastVideoTime=-1;poseLastDetection=0;errorCount=0;hadFace=false;status('실시간 표정 인식 중');hint('웃거나 팔을 들어 보세요!');s.getVideoTracks()[0]?.addEventListener('ended',()=>{if(token===session){stop();err('카메라 연결이 종료됐습니다.')}});

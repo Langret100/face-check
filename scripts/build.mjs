@@ -9,7 +9,7 @@ const mkdir = p => fs.mkdirSync(p,{recursive:true});
 const cp = (a,b) => { mkdir(path.dirname(b)); fs.copyFileSync(a,b); };
 const copyTree = (a,b) => { if(!fs.existsSync(a))throw Error('Missing npm package: '+a);fs.cpSync(a,b,{recursive:true});};
 const required = [
-  ['index.html','index.html'],['main.js','main.js'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
+  ['index.html','index.html'],['main.js','main.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
   ['node_modules/three/build/three.module.js','vendor/three/build/three.module.js'],
   ['node_modules/@mediapipe/tasks-vision/vision_bundle.mjs','vendor/mediapipe/vision_bundle.mjs']
 ];
