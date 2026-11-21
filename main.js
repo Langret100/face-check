@@ -160,7 +160,7 @@ const rigBones={};
 const aimVec=new THREE.Vector3(),fromVec=new THREE.Vector3(),parentQuat=new THREE.Quaternion(),aimQuat=new THREE.Quaternion(),worldQuat=new THREE.Quaternion(),boneWorld=new THREE.Vector3(),childWorld=new THREE.Vector3();
 const poseInfo={left:[],right:[],waist:0,lean:0};
 const poseSmooth={left:[],right:[]};
-let poseBlend=0, lastPoseFrame=0;
+let poseBlend=0, lastPoseFrame=0,frameDelta=.016;
 // Reuse expression bindings and math temporaries; never allocate arrays in every RAF.
 let morphTracks=[];
 const poseChestQ=new THREE.Quaternion(),poseLeanQ=new THREE.Quaternion(),poseEuler=new THREE.Euler();
@@ -172,6 +172,26 @@ const expressionKeys=Object.keys(target);
 const exprDrivePairs=Object.entries(exprTargets);
 const expressionWeights=Object.create(null);
 const smoothing=(a,b,k)=>a+(b-a)*k;
+// Procedural idle animation works with either VRM without bundled animation clips.
+// Face/pose tracking always takes precedence; easing avoids snapping at handoff.
+let idleFaceMix=1, idlePoseMix=1;
+let idlePhaseShift=0;
+const idleMotionQ=new THREE.Quaternion();
+const idleMotionDelta=new THREE.Quaternion();
+const idleFrame={t:0,blink:0,glance:0,tilt:0,pitch:0,breath:0,sway:0,animal:false};
+function idleSample(ts){
+ const t=ts*.001+idlePhaseShift;
+ const animal=framing?.kind==='squirrel';
+ const blinkCycle=(t+(animal?.38:0))%(animal?3.45:4.05);
+ const blink=Math.exp(-Math.pow((blinkCycle-.22)/.105,2));
+ const glance=Math.sin(t*(animal?.43:.29))*.095+Math.sin(t*.18+.8)*.045;
+ Object.assign(idleFrame,{t,blink,glance,tilt:Math.sin(t*.36+1.1)*(animal?.055:.035),
+  pitch:Math.sin(t*.58+.5)*(animal?.052:.036),
+  breath:Math.sin(t*(animal?2.15:1.55)),
+  sway:Math.sin(t*.57+.3),animal});
+ return idleFrame;
+}
+
 // Low-latency phrase echo: 170ms end-of-speech hold; local temporary memory only.
 // Avoid open-speaker live monitor: it causes acoustic feedback in a public exhibit.
 // Never send voice data over the network. A tap is required to request permission.
@@ -281,7 +301,7 @@ el('full').onclick=async()=>{try{if(document.fullscreenElement)await document.ex
 
 async function bindAvatar(gltf,kind){
  if(character)scene.remove(character);
- character=gltf.scene;scene.add(character);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;
+ character=gltf.scene;scene.add(character);idleFaceMix=1;idlePoseMix=1;idlePhaseShift=(kind==='squirrel'?.7:0);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;
  morphMeshes=[];headBone=null;animeMorphBindings=null;morphTracks=[];
  for(const key of Object.keys(rigBones))delete rigBones[key];
  character.traverse(o=>{if(o.isMesh&&o.morphTargetInfluences?.length){morphMeshes.push(o);o.frustumCulled=false;}if(o.isSkinnedMesh)o.frustumCulled=false;});
@@ -425,7 +445,28 @@ function draw(ts){requestAnimationFrame(draw);if(document.hidden||!renderer||!ca
  }
  if(demo&&!live){const t=(ts-demoStart)*.001;reset();const phase=(Math.floor(t/2.7)%6);const s=Math.sin(t*3.0);if(phase===0){target.joy=.85;target.a=Math.max(0,s)*.45}else if(phase===1){target.angry=.9;target.e=.3}else if(phase===2){target.sorrow=.9;target.o=.3}else if(phase===3){target.fun=.9;target.a=Math.max(0,s)*.95}else if(phase===4){target.i=.85;target.u=.25}else{target.a=.9;target.o=.1}target.blink_l=Math.pow(Math.max(0,Math.sin(t*2.3)),25);target.blink_r=target.blink_l;target.yaw=Math.sin(t*.8)*.17;target.roll=Math.sin(t*.95)*.1}
  if(temporaryEmotion){reset();target[temporaryEmotion]=.92;if(ts>emotionUntil){temporaryEmotion=null;reset();status('캐릭터 준비 완료')}}
- const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;
+ // Drive expressive, quiet idle motion while face tracking is missing or camera is off.
+ // The preview buttons remain exclusive: idle never stomps on a selected emotion.
+ const idle=idleSample(ts);
+ const idleAllowed=!demo&&!temporaryEmotion;
+ const faceTracking=live&&hadFace;
+ const idleFaceGoal=idleAllowed&&!faceTracking?1:0;
+ const idleStep=1-Math.exp(-frameDelta*2.5);
+ idleFaceMix+=(idleFaceGoal-idleFaceMix)*idleStep;
+ if(idleAllowed&&!faceTracking)reset();
+ if(idleAllowed&&idleFaceMix>.001){
+  const f=idleFaceMix;
+  target.blink_l=Math.max(target.blink_l,idle.blink*f);
+  target.blink_r=Math.max(target.blink_r,idle.blink*f);
+  target.yaw+=idle.glance*f;
+  target.roll+=idle.tilt*f;
+  target.pitch+=idle.pitch*f;
+  // A subtle friendly idle expression, not a fixed open-mouth grin.
+  target.joy+=f*(idle.animal?.18:.13)*(0.55+.45*Math.sin(idle.t*.4));
+  if(idle.animal){target.a+=f*.035*Math.max(0,Math.sin(idle.t*.65));}
+ }
+
+ const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;frameDelta=dt;
  // Time-correct smoothing keeps the same feel at 30/60/120Hz.
  for(const key of expressionKeys){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))}
  // Direct-write the cached mesh/morph pairs. No per-frame Map/Object.entries or push/clear.
@@ -584,7 +625,12 @@ function segmentDirection(p,q){
 }
 function updatePoseAnimation(ts){
  if(!character)return;
- const active=live && (ts-poseGoodAt<800);poseBlend=smoothing(poseBlend,active?1:0,active?.24:.11);
+ const active=live && (ts-poseGoodAt<800);
+ const idle=idleSample(ts);
+ const idleGoal=(!demo&&!temporaryEmotion&&!active)?1:0;
+ const smoothIdle=1-Math.exp(-frameDelta*2.0);
+ idlePoseMix+=(idleGoal-idlePoseMix)*smoothIdle;
+ poseBlend=smoothing(poseBlend,active?1:0,active?.24:.11);
  if(!active){armTarget=0;if(bodyDetected&&ts-poseGoodAt>1300){bodyDetected=false;el('poseStatus').textContent='팔·어깨를 카메라에 보여 주세요'}}
  // Camera remains fixed as arms move. No dynamic zoom or recentering.
  if(active)poseLeanQ.setFromEuler(poseEuler.set(0,0,(poseInfo.lean+poseInfo.waist)*.20*poseBlend));
@@ -592,6 +638,11 @@ function updatePoseAnimation(ts){
   const entry=rigBones[key];if(!entry)continue;
   poseChestQ.copy(entry.rest);
   if(active)poseChestQ.multiply(poseLeanQ);
+  // Very slight breathing and upper-body sway during idle.
+  if(idlePoseMix>.001){
+   poseEuler.set(idle.breath*.009*idlePoseMix,0,idle.sway*.013*idlePoseMix);
+   poseChestQ.multiply(idleMotionDelta.setFromEuler(poseEuler));
+  }
   entry.bone.quaternion.slerp(poseChestQ,.18);
  }
  character.updateMatrixWorld(true);
@@ -612,7 +663,25 @@ function updatePoseAnimation(ts){
    aimBone(upper,lower.bone,...first,.32*poseBlend);
    aimBone(lower,palm.bone,...second,.33*poseBlend);
   }else{
-   for(const entry of [shoulderEntry,upper,lower])if(entry)entry.bone.quaternion.slerp(entry.rest,.11);
+   // Return to relaxed arm rest, with gentle asymmetric movement while idle.
+   const sign=side==='left'?1:-1;
+   const t=idle.t;
+   if(shoulderEntry){
+    idleMotionQ.copy(shoulderEntry.rest).multiply(idleMotionDelta.setFromEuler(
+     poseEuler.set(Math.sin(t*.82+(sign>0?0:1.1))*.018*idlePoseMix,0,sign*.012*idlePoseMix)));
+    shoulderEntry.bone.quaternion.slerp(idleMotionQ,.11);
+   }
+   if(upper){
+    idleMotionQ.copy(upper.rest).multiply(idleMotionDelta.setFromEuler(
+     poseEuler.set(Math.sin(t*.62+(sign>0?1.1:2.7))*.028*idlePoseMix,
+      0,sign*(.021+.016*idle.sway)*idlePoseMix)));
+    upper.bone.quaternion.slerp(idleMotionQ,.11);
+   }
+   if(lower){
+    idleMotionQ.copy(lower.rest).multiply(idleMotionDelta.setFromEuler(
+     poseEuler.set(Math.sin(t*.74+(sign>0?2:3.5))*.028*idlePoseMix,0,0)));
+    lower.bone.quaternion.slerp(idleMotionQ,.11);
+   }
   }
   if(upper)upper.bone.updateMatrixWorld(true);
  }
