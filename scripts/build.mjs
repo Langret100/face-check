@@ -9,7 +9,7 @@ const mkdir = p => fs.mkdirSync(p,{recursive:true});
 const cp = (a,b) => { mkdir(path.dirname(b)); fs.copyFileSync(a,b); };
 const copyTree = (a,b) => { if(!fs.existsSync(a))throw Error('Missing npm package: '+a);fs.cpSync(a,b,{recursive:true});};
 const required = [
-  ['index.html','index.html'],['main.js','main.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
+  ['index.html','index.html'],['main.js','main.js'],['inference-worker.js','inference-worker.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
   ['node_modules/three/build/three.module.js','vendor/three/build/three.module.js'],
   ['node_modules/@mediapipe/tasks-vision/vision_bundle.mjs','vendor/mediapipe/vision_bundle.mjs']
 ];
@@ -32,6 +32,12 @@ function get(url, target, redirects=0) { return new Promise((resolve,reject)=>{
   file.on('error',reject);
  });request.on('timeout',()=>request.destroy(Error('Download timed out: '+url)));request.on('error',reject);
 }); }
+// User-provided VRoid beta HairSample_Female VRM, CC0 per official VRoid FAQ.
+// Bundle it locally: no dependency on a third-party GitHub download during build.
+const animeFile=path.join(root,'assets/anime-female.vrm');
+if(!fs.existsSync(animeFile))throw Error('Required bundled CC0 avatar missing: assets/anime-female.vrm');
+if(fs.statSync(animeFile).size<500000)throw Error('CC0 avatar unexpectedly small');
+cp(animeFile,path.join(dist,'assets/anime-female.vrm'));
 const models = [
  ['face_landmarker.task','https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',1000000],
  ['pose_landmarker_lite.task','https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',1000000]
@@ -48,9 +54,9 @@ for (const [name,url,minBytes] of models){
 }
 fs.writeFileSync(path.join(dist,'.nojekyll'),'');
 const html=fs.readFileSync(path.join(dist,'index.html'),'utf8');
-const js=fs.readFileSync(path.join(dist,'main.js'),'utf8');
+const js=fs.readFileSync(path.join(dist,'main.js'),'utf8')+fs.readFileSync(path.join(dist,'inference-worker.js'),'utf8');
 if (/cdn\.jsdelivr|unpkg\.com|storage\.googleapis/.test(html+js))throw Error('Runtime still refers to remote assets');
 const files=fs.readdirSync(path.join(dist,'vendor/mediapipe/wasm'));
 if (!files.some(f=>f.endsWith('.wasm')) || !files.some(f=>f.endsWith('.js')))throw Error('MediaPipe WASM or loader missing');
-for(const requiredFile of ['index.html','main.js','assets/mr-squirrel.vrm','vendor/mediapipe/vision_bundle.mjs','vendor/three/build/three.module.js','models/face_landmarker.task','models/pose_landmarker_lite.task']){ if(!fs.existsSync(path.join(dist,requiredFile))) throw Error('Missing deployment asset: '+requiredFile); }
+for(const requiredFile of ['index.html','main.js','inference-worker.js','assets/mr-squirrel.vrm','assets/anime-female.vrm','vendor/mediapipe/vision_bundle.mjs','vendor/three/build/three.module.js','models/face_landmarker.task','models/pose_landmarker_lite.task']){ if(!fs.existsSync(path.join(dist,requiredFile))) throw Error('Missing deployment asset: '+requiredFile); }
 console.log('Self-hosted site ready:',dist,'WASM files:',files.length);
