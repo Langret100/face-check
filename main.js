@@ -78,8 +78,8 @@ const aiPerf={timer:null,token:0,faceMs:75,poseMs:150,faceCost:0,poseCost:0,next
 let aiWorker=null,workerReady=false,workerFrameInFlight=false,workerErrors=0;
 let workerFrameId=0,workerLastVideoTime=-1,workerLastSend=0,workerInitPromise=null;
 function shutdownWorker(){
- if(aiWorker){aiWorker.terminate();aiWorker=null}
- workerReady=false;workerBusy=false;workerFrameInFlight=false;workerInitPromise=null;
+ if(aiWorker){try{aiWorker.terminate()}catch(e){console.warn('Worker shutdown:',e)}aiWorker=null}
+ workerReady=false;workerFrameInFlight=false;workerInitPromise=null;
 }
 async function initInferenceWorker(){
  if(workerReady)return true;
@@ -87,8 +87,14 @@ async function initInferenceWorker(){
  workerInitPromise=new Promise((resolve,reject)=>{
   if(!window.Worker||!window.createImageBitmap){reject(Error('Worker/ImageBitmap unsupported'));return}
   let settled=false;
-  const fail=(err)=>{if(settled)return;settled=true;clearTimeout(watchdog);shutdownWorker();reject(err instanceof Error?err:Error(String(err)))};
-  const watchdog=setTimeout(()=>fail(Error('Worker AI initialization timeout')),18000);
+  const fail=(reason)=>{
+   if(settled)return;settled=true;clearTimeout(watchdog);
+   // Even if cleanup throws, settle the initialization promise. v24 had an
+   // undeclared variable here, permanently freezing camera startup.
+   try{shutdownWorker()}catch(cleanupError){console.error('Worker cleanup failure',cleanupError)}
+   reject(reason instanceof Error?reason:Error(String(reason)));
+  };
+  const watchdog=setTimeout(()=>fail(Error('Worker AI initialization timeout (18s)')),18000);
   const w=new Worker(new URL('./inference-worker.js',import.meta.url),{type:'module'});
   aiWorker=w;
   w.onmessage=({data})=>{
@@ -173,7 +179,7 @@ async function useMainInferenceFallback(){
  try{
   await getLandmarker();
   if(live){beginInference();getPoseLandmarker().catch(console.warn)}
- }catch(e){err('얼굴 인식 모델을 시작하지 못했습니다: '+(e.message||e))}
+ }catch(e){if(live){stop();const reason='얼굴 인식 모델을 시작하지 못했습니다: '+(e.message||e);err(reason);showStartupError(reason)}}
  finally{workerFallbackStarting=false}
 }
 // Independent body tracking, decoupled from face detection so face/TTS still work on pose failure.
@@ -812,21 +818,78 @@ async function getLandmarker(){
  });
  return landmarker;
 }
-async function startCamera(){if(!modelReady||autoStarting||live)return;autoStarting=true;stop();clearErr();const token=++session;el('retry').hidden=true;el('stop').disabled=false;status('카메라 연결 중');hint('웹캠 권한을 허용해 주세요');try{
+// Startup is always bounded. Worker failure -> main-thread fallback -> visible
+// error/retry. Keep render and input-camera resolutions unchanged.
+const FACE_STARTUP_DEADLINE_MS=42000;
+function withStartupDeadline(promise,ms=FACE_STARTUP_DEADLINE_MS){
+ let timeoutId;
+ const deadline=new Promise((_,reject)=>{timeoutId=setTimeout(()=>{
+  const error=Error('AI 모델 초기화 시간이 초과되었습니다. 네트워크 또는 AI 배포 파일을 확인해 주세요.');
+  error.code='AI_STARTUP_TIMEOUT';reject(error);
+ },ms)});
+ return Promise.race([promise,deadline]).finally(()=>clearTimeout(timeoutId));
+}
+function hideStartupError(){const panel=el('aiError');if(panel)panel.hidden=true}
+function showStartupError(message){
+ const panel=el('aiError'),copy=el('aiErrorMessage');
+ if(copy)copy.textContent=message;
+ if(panel)panel.hidden=false;
+ status('얼굴 인식 시작 실패');
+ hint('오류 안내를 확인한 뒤 다시 시도해 주세요');
+}
+async function checkDeploymentAssets(){
+ if(typeof fetch!=='function')return '';
+ // HEAD requests do not download multi-MB model files. Probe simultaneously to
+ // avoid multiplying timeout delays if a network proxy rejects the requests.
+ const candidates=[
+  ['./vendor/mediapipe/vision_bundle.mjs','MediaPipe 실행 파일'],
+  ['./vendor/mediapipe/wasm/vision_wasm_internal.wasm','MediaPipe WASM'],
+  ['./models/face_landmarker.task','얼굴 인식 모델']
+ ];
+ const checks=await Promise.all(candidates.map(async ([path,label])=>{
+  const controller=typeof AbortController==='function'?new AbortController():null;
+  const timer=setTimeout(()=>controller?.abort(),3000);
+  try{
+   const response=await fetch(path,{method:'HEAD',cache:'no-store',...(controller?{signal:controller.signal}:{})});
+   const contentType=response.headers?.get('content-type')||'';
+   if((!response.ok&&response.status!==405&&response.status!==501)||contentType.includes('text/html')){
+    return `${label} (${path}, HTTP ${response.status})`;
+   }
+  }catch(e){/* Offline/network failure: original exception remains visible. */}
+  finally{clearTimeout(timer)}
+  return '';
+ }));
+ const missing=checks.filter(Boolean);
+ return missing.length?'배포 파일 누락/잘못된 응답: '+missing.join(', ')+'. GitHub Actions의 Pages 배포 결과(dist)를 확인하세요.':'';
+}
+async function reportStartupFailure(error){
+ let message=error?.message||String(error);
+ const detail=await checkDeploymentAssets();
+ if(detail)message+=' '+detail;
+ return message;
+}
+async function startCamera(){if(!modelReady||autoStarting||live)return;autoStarting=true;stop();clearErr();hideStartupError();const token=++session;el('retry').hidden=true;el('stop').disabled=false;status('카메라 연결 중');hint('웹캠 권한을 허용해 주세요');try{
  if(!navigator.mediaDevices?.getUserMedia)throw Error('카메라는 HTTPS 또는 localhost에서만 사용 가능합니다.');
  // Begin loading AI model while user is answering the camera permission prompt.
  const faceReady=initInferenceWorker().catch(e=>{console.warn('Worker unavailable; using main-thread inference',e);return getLandmarker()});faceReady.catch(()=>{});
  let s;try{s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'user'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false})}
- catch(firstError){if(firstError.name==='OverconstrainedError'||firstError.name==='NotFoundError'||firstError.name==='NotReadableError')s=await navigator.mediaDevices.getUserMedia({video:true,audio:false});else throw firstError;}if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');if(!echo.enabled&&!echo.starting)toggleEcho();status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');await faceReady;if(token!==session)return;
+ catch(firstError){if(firstError.name==='OverconstrainedError'||firstError.name==='NotFoundError'||firstError.name==='NotReadableError')s=await navigator.mediaDevices.getUserMedia({video:true,audio:false});else throw firstError;}if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');if(!echo.enabled&&!echo.starting)toggleEcho();status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');
+  const slowTimer=setTimeout(()=>{if(token===session){status('얼굴 인식 모델 확인 중');hint('초기화가 지연되고 있습니다. AI 파일과 브라우저 지원 여부를 확인하고 있습니다.')}},12000);
+  try{await withStartupDeadline(faceReady)}finally{clearTimeout(slowTimer)}
+  if(token!==session)return;
  // Pose is optional and starts in parallel; a failed pose download must not block face tracking.
  if(!workerReady)setTimeout(()=>{if(token===session)getPoseLandmarker().catch(e=>console.warn('Pose unavailable:',e));},500);
  live=true;beginInference();demo=false;lastVideoTime=-1;lastDetection=0;poseLastVideoTime=-1;poseLastDetection=0;errorCount=0;hadFace=false;status('실시간 표정 인식 중');hint('웃거나 팔을 들어 보세요!');s.getVideoTracks()[0]?.addEventListener('ended',()=>{if(token===session){stop();err('카메라 연결이 종료됐습니다.')}});
- }catch(e){if(token===session){stop();const name=e?.name||'';
- const cameraError=['NotFoundError','NotReadableError','NotAllowedError','OverconstrainedError'].includes(name);
- const message=name==='NotFoundError'?'사용 가능한 카메라를 찾지 못했습니다. 카메라 연결을 확인해 주세요.':name==='NotAllowedError'?'카메라 권한이 차단되었습니다. 주소창에서 카메라를 허용해 주세요.':name==='NotReadableError'?'다른 앱에서 카메라를 사용 중일 수 있습니다. 카메라를 닫고 재시도해 주세요.':(e?.message||String(e));
- err((cameraError?'카메라 연결 실패: ':'AI 인식 시작 실패: ')+message);
- hint(cameraError?'카메라를 연결하거나 권한을 허용한 후 재연결해 주세요':'AI 모델 파일을 확인한 후 다시 연결해 주세요');}}finally{autoStarting=false}}
-el('retry').onclick=startCamera;
+ }catch(e){if(token===session){
+  stop();const failureSession=session;
+  if(e?.code==='AI_STARTUP_TIMEOUT'){shutdownWorker();visionRuntimePromise=null}
+  const name=e?.name||'';
+  const cameraError=['NotFoundError','NotReadableError','NotAllowedError','OverconstrainedError'].includes(name);
+  const basic=name==='NotFoundError'?'사용 가능한 카메라를 찾지 못했습니다. 카메라 연결을 확인해 주세요.':name==='NotAllowedError'?'카메라 권한이 차단되었습니다. 주소창에서 카메라를 허용해 주세요.':name==='NotReadableError'?'다른 앱에서 카메라를 사용 중일 수 있습니다. 카메라를 닫고 재시도해 주세요.':(e?.message||String(e));
+  const message=cameraError?basic:await reportStartupFailure(e);
+  if(failureSession===session){err((cameraError?'카메라 연결 실패: ':'AI 인식 시작 실패: ')+message);showStartupError(message)}
+ }}finally{autoStarting=false}}
+el('retry').onclick=startCamera;el('aiRetry').onclick=startCamera;
 el('voice').onclick=()=>{voiceState.enabled=!voiceState.enabled;el('voice').textContent=voiceState.enabled?'🔊 목소리 켜짐':'🔇 목소리 꺼짐';if(!voiceState.enabled)clearVoice();else{try{speechSynthesis.getVoices()}catch(e){}}};
 window.addEventListener('pointerdown',()=>{voiceNeedsGesture=false;if(voiceState.enabled&&'speechSynthesis' in window){speechSynthesis.resume()}},{passive:true});
 el('echo').onclick=toggleEcho;window.addEventListener('pagehide',()=>{stop();stopEcho()});document.addEventListener('visibilitychange',()=>{if(document.hidden){if(live)stop();if(echo.enabled)stopEcho()}else if(modelReady&&!live&&!autoStarting)startCamera()});
