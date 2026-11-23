@@ -9,7 +9,7 @@ const mkdir = p => fs.mkdirSync(p,{recursive:true});
 const cp = (a,b) => { mkdir(path.dirname(b)); fs.copyFileSync(a,b); };
 const copyTree = (a,b) => { if(!fs.existsSync(a))throw Error('Missing npm package: '+a);fs.cpSync(a,b,{recursive:true});};
 const required = [
-  ['index.html','index.html'],['ASSET_LICENSES.md','ASSET_LICENSES.md'],['main.js','main.js'],['inference-worker.js','inference-worker.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
+  ['index.html','index.html'],['ASSET_LICENSES.md','ASSET_LICENSES.md'],['main.js','main.js'],['interaction-core.js','interaction-core.js'],['inference-worker.js','inference-worker.js'],['assets/squirrel-burrow.webp','assets/squirrel-burrow.webp'],['assets/mr-squirrel.vrm','assets/mr-squirrel.vrm'],
   ['node_modules/three/build/three.module.js','vendor/three/build/three.module.js'],
   ['node_modules/@mediapipe/tasks-vision/vision_bundle.mjs','vendor/mediapipe/vision_bundle.mjs']
 ];
@@ -54,9 +54,9 @@ for (const [name,url,minBytes] of models){
 }
 fs.writeFileSync(path.join(dist,'.nojekyll'),'');
 const html=fs.readFileSync(path.join(dist,'index.html'),'utf8');
-const js=fs.readFileSync(path.join(dist,'main.js'),'utf8')+fs.readFileSync(path.join(dist,'inference-worker.js'),'utf8');
+const js=['main.js','interaction-core.js','inference-worker.js'].map(n=>fs.readFileSync(path.join(dist,n),'utf8')).join('\n');
 if (/cdn\.jsdelivr|unpkg\.com|storage\.googleapis/.test(html+js))throw Error('Runtime still refers to remote assets');
 const files=fs.readdirSync(path.join(dist,'vendor/mediapipe/wasm'));
 if (!files.some(f=>f.endsWith('.wasm')) || !files.some(f=>f.endsWith('.js')))throw Error('MediaPipe WASM or loader missing');
-for(const requiredFile of ['index.html','main.js','inference-worker.js','assets/mr-squirrel.vrm','assets/anime-female.vrm','vendor/mediapipe/vision_bundle.mjs','vendor/three/build/three.module.js','models/face_landmarker.task','models/pose_landmarker_lite.task']){ if(!fs.existsSync(path.join(dist,requiredFile))) throw Error('Missing deployment asset: '+requiredFile); }
+for(const requiredFile of ['index.html','main.js','interaction-core.js','inference-worker.js','assets/mr-squirrel.vrm','assets/anime-female.vrm','vendor/mediapipe/vision_bundle.mjs','vendor/three/build/three.module.js','models/face_landmarker.task','models/pose_landmarker_lite.task']){ if(!fs.existsSync(path.join(dist,requiredFile))) throw Error('Missing deployment asset: '+requiredFile); }
 console.log('Self-hosted site ready:',dist,'WASM files:',files.length);

@@ -1,58 +1,81 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { SPEECH_PROFILES,chooseKoreanVoice,classifyExpression,cameraSegmentToModel,armRaised,headPoseFromMatrix } from './interaction-core.js';
 
 const el=id=>document.getElementById(id), canvas=el('three'), video=el('video');
 // One Three.js renderer and one MediaPipe tracker are shared by both VRM models.
 // The larger human model loads only when requested in settings.
-let selectedAvatar='squirrel',animeModelPromise=null,avatarSwitchToken=0;
+let selectedAvatar='squirrel',boundAvatarKind=null,animeModelPromise=null,avatarSwitchToken=0,avatarSwitchQueue=Promise.resolve();
+// Keep each GLTF's bind pose untouched across repeated avatar selections.
+const avatarBindPoses=new WeakMap();
 const settings=el('characterSettings');
 function showSettings(v){settings.hidden=!v;el('settingsButton').setAttribute('aria-expanded',String(v))}
 el('settingsButton').addEventListener('click',()=>showSettings(settings.hidden));
 el('settingsClose').addEventListener('click',()=>showSettings(false));
-async function switchAvatar(name){
- if(name===selectedAvatar)return;
+function switchAvatar(name){
+ // Serialize async GLTF bone binding: stale loads cannot overwrite a newer radio choice.
  const token=++avatarSwitchToken;
+ avatarSwitchQueue=avatarSwitchQueue.catch(()=>{}).then(()=>performAvatarSwitch(name,token));
+ return avatarSwitchQueue;
+}
+async function performAvatarSwitch(name,token){
+ if(token!==avatarSwitchToken)return;
  const msg=el('characterSettingsStatus');
+ const inputs=[...document.querySelectorAll('input[name=avatar]')];
+ if(name===selectedAvatar&&boundAvatarKind===name){
+  msg.textContent='현재 캐릭터가 선택되어 있습니다.';
+  return;
+ }
  el('settingsButton').disabled=true;
+ inputs.forEach(input=>input.disabled=true);
  try{
+  let gltf;
   if(name==='anime'){
    msg.textContent='사람형 3D 모델을 처음 불러오는 중…';
    if(!animeModelPromise)animeModelPromise=new GLTFLoader().loadAsync('./assets/anime-female.vrm').catch(e=>{animeModelPromise=null;throw e});
-   const gltf=await animeModelPromise;
-   if(token!==avatarSwitchToken)return;
-   await bindAvatar(gltf,'anime');
-   selectedAvatar='anime';
-   el('characterLabel').textContent='Anime · AvatarSample A';
-   el('licenseNotice').textContent='사람형: VRoid AvatarSample_A · 공식 무료 이용약관 (CC0 아님)';
-   msg.textContent='사람형 캐릭터 선택 완료 · 얼굴·팔 추적 공유';
+   gltf=await animeModelPromise;
   }else{
    if(!squirrelScene)throw Error('다람쥐 모델이 아직 준비되지 않았습니다.');
-   await bindAvatar(squirrelScene,'squirrel');
-   selectedAvatar='squirrel';
-   el('characterLabel').textContent='Mr Squirrel';
-   el('licenseNotice').textContent='모델: Mr Squirrel · CC0';
-   msg.textContent='다람쥐 선택 완료';
+   gltf=squirrelScene;
   }
+  if(token!==avatarSwitchToken)return;
+  await bindAvatar(gltf,name);
+  if(token!==avatarSwitchToken)return;
+  selectedAvatar=name;
+  el('characterLabel').textContent=name==='anime'?'Anime · AvatarSample A':'Mr Squirrel';
+  el('licenseNotice').textContent=name==='anime'?'사람형: VRoid AvatarSample_A · 공식 무료 이용약관 (CC0 아님)':'모델: Mr Squirrel · CC0';
+  msg.textContent=name==='anime'?'사람형 캐릭터 선택 완료 · 얼굴·팔 추적 공유':'다람쥐 선택 완료';
   clearVoice();voiceState.lastKind='';voiceState.lastAt=-30000;
+  voiceState.greeted=false;voiceState.pendingGreetingAt=live?performance.now()+800:0;
   status('캐릭터 준비 완료');
  }catch(e){
-  // Rebind the previous cached model if the new one did not pass validation.
-  try{if(selectedAvatar==='squirrel'&&squirrelScene)await bindAvatar(squirrelScene,'squirrel');}catch(restoreError){console.error('Restore previous avatar failed',restoreError)}
+  // Restore the last good avatar after a failed asynchronous rebind.
+  try{if(selectedAvatar==='squirrel'&&squirrelScene)await bindAvatar(squirrelScene,'squirrel');
+   else if(selectedAvatar==='anime'&&animeModelPromise)await bindAvatar(await animeModelPromise,'anime');}
+  catch(restoreError){console.error('Restore previous avatar failed',restoreError)}
   msg.textContent='캐릭터 전환 실패: '+(e?.message||e);
-  document.querySelector(`input[name=avatar][value=${selectedAvatar}]`).checked=true;
   console.error('Avatar selection failed',e);
- }finally{el('settingsButton').disabled=false}
+ }finally{
+  if(token===avatarSwitchToken){
+   inputs.forEach(input=>{input.disabled=false;input.checked=input.value===selectedAvatar});
+   el('settingsButton').disabled=false;
+  }else{
+   // The queued newer choice will own the radio state and restore controls.
+   el('settingsButton').disabled=false;
+   inputs.forEach(input=>input.disabled=false);
+  }
+ }
 }
 document.querySelectorAll('input[name=avatar]').forEach(input=>input.addEventListener('change',()=>{if(input.checked)switchAvatar(input.value)}));
 const neutral={a:0,i:0,u:0,e:0,o:0,blink_l:0,blink_r:0,joy:0,angry:0,sorrow:0,fun:0,yaw:0,pitch:0,roll:0};
-const target={...neutral},current={...neutral};
+const target={...neutral},current={...neutral},renderTarget={...neutral};
 const exprTargets={a:11,i:9,u:7,e:10,o:8,blink_l:1,blink_r:0,joy:5,angry:4,sorrow:3,fun:6};
 // v20: FHD pixel count remains fixed; optimize computation and compositing instead.
-let frameAt=0,lastWidth=0,lastHeight=0,lastDpr=0,autoStarting=false,inferTurn=0;let fpsFrames=0,fpsAt=0;
+let frameAt=0,lastWidth=0,lastHeight=0,lastDpr=0,autoStarting=false;let fpsFrames=0,fpsAt=0;
 // Worker performs CPU MediaPipe inference away from requestAnimationFrame.
 // A bounded main-thread fallback keeps the app usable on browsers that restrict workers.
 const aiPerf={timer:null,token:0,faceMs:75,poseMs:150,faceCost:0,poseCost:0,nextFace:0,nextPose:0};
-let aiWorker=null,workerReady=false,workerBusy=false,workerFrameInFlight=false,workerErrors=0;
+let aiWorker=null,workerReady=false,workerFrameInFlight=false,workerErrors=0;
 let workerFrameId=0,workerLastVideoTime=-1,workerLastSend=0,workerInitPromise=null;
 function shutdownWorker(){
  if(aiWorker){aiWorker.terminate();aiWorker=null}
@@ -74,6 +97,7 @@ async function initInferenceWorker(){
    } else if(data.type==='pose-ready'){
     el('poseStatus').textContent='몸동작 인식 준비 완료';
    } else if(data.type==='result'){
+    if(data.sessionId!==workerFrameId)return;
     workerFrameInFlight=false;
     if(!live||document.hidden)return;
     workerErrors=0;
@@ -85,13 +109,13 @@ async function initInferenceWorker(){
      aiPerf[key]=aiPerf[key]*.8+data.cost*.2;
     }
    } else if(data.type==='error'){
+    if(data.sessionId!==undefined&&data.sessionId!==workerFrameId)return;
     workerFrameInFlight=false;
     if(!settled){fail(Error(data.message||'Worker initialization error'));return}
     // A failed Pose init must not silently leave the second avatar motionless.
     if(String(data.message||'').startsWith('Pose optional:')){
-     el('poseStatus').textContent='팔 AI 재연결 중';
-     console.warn('Worker pose unavailable; retrying the standard tracker',data.message);
-     useMainInferenceFallback();
+     el('poseStatus').textContent='팔 AI 사용 불가 · 얼굴 인식은 계속 동작';
+     console.warn('Worker pose unavailable; keeping face tracking in the worker',data.message);
      return;
     }
     if(++workerErrors>5){console.warn('Worker failed, switching to CPU fallback',data.message);useMainInferenceFallback()}
@@ -102,7 +126,7 @@ async function initInferenceWorker(){
  });
  try{return await workerInitPromise}catch(e){workerInitPromise=null;throw e}
 }
-function stopInference(){aiPerf.token++;if(aiPerf.timer!==null)clearTimeout(aiPerf.timer);aiPerf.timer=null;workerFrameId++;workerFrameInFlight=false}
+function stopInference(){workerLastVideoTime=-1;aiPerf.token++;if(aiPerf.timer!==null)clearTimeout(aiPerf.timer);aiPerf.timer=null;workerFrameId++;workerFrameInFlight=false}
 function beginInference(){
  stopInference();const token=aiPerf.token;aiPerf.nextFace=0;aiPerf.nextPose=0;
  const tick=()=>{
@@ -117,9 +141,9 @@ function beginInference(){
     const seq=workerFrameId;
     createImageBitmap(video).then(frame=>{
      if(token!==aiPerf.token||seq!==workerFrameId||!aiWorker){frame.close();workerFrameInFlight=false;return}
-     try{aiWorker.postMessage({type:'frame',bitmap:frame,timestamp:performance.now()},[frame])}
+     try{aiWorker.postMessage({type:'frame',bitmap:frame,timestamp:performance.now(),sessionId:seq},[frame])}
      catch(e){frame.close();workerFrameInFlight=false;console.warn('Worker transfer failed',e);useMainInferenceFallback()}
-    }).catch(e=>{workerFrameInFlight=false;if(++workerErrors>5)useMainInferenceFallback()});
+    }).catch(e=>{if(token!==aiPerf.token||seq!==workerFrameId)return;workerFrameInFlight=false;if(++workerErrors>5)useMainInferenceFallback()});
    }
   }else{
    // Max one synchronous CPU inference per tick on browsers without worker support.
@@ -178,6 +202,8 @@ let idleFaceMix=1, idlePoseMix=1;
 let idlePhaseShift=0;
 const idleMotionQ=new THREE.Quaternion();
 const idleMotionDelta=new THREE.Quaternion();
+const firstSegment={x:0,y:0,z:0},secondSegment={x:0,y:0,z:0};
+let poseRevision=0,poseRigRevision=-1;
 const idleFrame={t:0,blink:0,glance:0,tilt:0,pitch:0,breath:0,sway:0,animal:false};
 function idleSample(ts){
  const t=ts*.001+idlePhaseShift;
@@ -185,19 +211,20 @@ function idleSample(ts){
  const blinkCycle=(t+(animal?.38:0))%(animal?3.45:4.05);
  const blink=Math.exp(-Math.pow((blinkCycle-.22)/.105,2));
  const glance=Math.sin(t*(animal?.43:.29))*.095+Math.sin(t*.18+.8)*.045;
- Object.assign(idleFrame,{t,blink,glance,tilt:Math.sin(t*.36+1.1)*(animal?.055:.035),
-  pitch:Math.sin(t*.58+.5)*(animal?.052:.036),
-  breath:Math.sin(t*(animal?2.15:1.55)),
-  sway:Math.sin(t*.57+.3),animal});
+ idleFrame.t=t;idleFrame.blink=blink;idleFrame.glance=glance;
+ idleFrame.tilt=Math.sin(t*.36+1.1)*(animal?.055:.035);
+ idleFrame.pitch=Math.sin(t*.58+.5)*(animal?.052:.036);
+ idleFrame.breath=Math.sin(t*(animal?2.15:1.55));
+ idleFrame.sway=Math.sin(t*.57+.3);idleFrame.animal=animal;
  return idleFrame;
 }
 
 // Low-latency phrase echo: 170ms end-of-speech hold; local temporary memory only.
 // Avoid open-speaker live monitor: it causes acoustic feedback in a public exhibit.
 // Never send voice data over the network. A tap is required to request permission.
-const echo={enabled:false,starting:false,stream:null,ctx:null,analyser:null,data:null,recorder:null,chunks:[],speaking:false,startedAt:0,quietAt:0,playing:false,source:null,raf:0,cooldown:0,serial:0};
+const echo={enabled:false,starting:false,stream:null,ctx:null,analyser:null,data:null,recorder:null,chunks:[],speaking:false,startedAt:0,quietAt:0,playing:false,source:null,timer:0,cooldown:0,serial:0};
 async function stopEcho(){
- ++echo.serial; echo.enabled=false;echo.chunks.length=0;echo.data=null;echo.analyser=null;cancelAnimationFrame(echo.raf);if(echo.recorder&&echo.recorder.state!=='inactive'){echo.recorder.onstop=null;try{echo.recorder.stop()}catch{}}
+ ++echo.serial; echo.enabled=false;echo.chunks.length=0;echo.data=null;echo.analyser=null;clearTimeout(echo.timer);if(echo.recorder&&echo.recorder.state!=='inactive'){echo.recorder.onstop=null;try{echo.recorder.stop()}catch{}}
  try{echo.source?.stop()}catch{};if(echo.source){try{echo.source.disconnect()}catch{};echo.source.buffer=null;}echo.source=null;echo.stream?.getTracks().forEach(t=>t.stop());echo.stream=null;
  try{await echo.ctx?.close()}catch{};echo.ctx=null;echo.recorder=null;echo.speaking=false;echo.playing=false;
  const b=el('echo');if(b)b.textContent='🎤 마이크 켜기';
@@ -213,16 +240,17 @@ async function toggleEcho(){
   const ctx=new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();if(token!==echo.serial){microphone.getTracks().forEach(t=>t.stop());await ctx.close();return;}
   const src=ctx.createMediaStreamSource(microphone),analyser=ctx.createAnalyser();analyser.fftSize=1024;analyser.smoothingTimeConstant=.15;src.connect(analyser);
   Object.assign(echo,{enabled:true,stream:microphone,ctx,analyser,data:new Uint8Array(analyser.fftSize),speaking:false,playing:false,cooldown:performance.now()+500});
-  try{speechSynthesis.cancel();el('voiceBubble').hidden=true;}catch{}
-  el('echo').textContent='🎤 말 따라하기 끄기';clearErr();echo.raf=requestAnimationFrame(monitorEcho);
+  // Let spontaneous character speech continue; the VAD pauses while it plays.
+  el('echo').textContent='🎤 말 따라하기 끄기';clearErr();echo.timer=setTimeout(monitorEcho,32);
   microphone.getAudioTracks()[0].addEventListener('ended',()=>stopEcho());
  }catch(e){await stopEcho();el('echo').textContent='🎤 마이크 켜기';hint('마이크가 차단됐어요. 버튼을 눌러 허용해 주세요.');console.warn('마이크 자동 시작 제한:',e);}
  finally{echo.starting=false;}
 }
-function monitorEcho(now){
+function monitorEcho(){
+ const now=performance.now();
  if(!echo.enabled||!echo.analyser)return;
- echo.raf=requestAnimationFrame(monitorEcho);
- if(echo.playing||now<echo.cooldown)return;
+ echo.timer=setTimeout(monitorEcho,32);
+ if(echo.playing||voicePlaybackActive||now<echo.cooldown)return;
  echo.analyser.getByteTimeDomainData(echo.data);
  let power=0;for(const x of echo.data){const d=(x-128)/128;power+=d*d}
  const rms=Math.sqrt(power/echo.data.length),isTalking=rms>.031;
@@ -250,49 +278,105 @@ async function playEcho(mime){
   const blob=new Blob(echo.chunks,{type:mime||'audio/webm'});echo.chunks=[];
   const buffer=await echo.ctx.decodeAudioData(await blob.arrayBuffer());
   if(!echo.enabled||token!==echo.serial||!echo.ctx||buffer.duration<.25||buffer.duration>7)return;
-  if('speechSynthesis' in window){speechSynthesis.cancel();el('voiceBubble').hidden=true;}
   const source=echo.ctx.createBufferSource(),filter=echo.ctx.createBiquadFilter(),gain=echo.ctx.createGain();
   source.buffer=buffer;const animeVoice=selectedAvatar==='anime';
-  source.playbackRate.value=animeVoice?1.18:1.55;
-  filter.type='highpass';filter.frequency.value=animeVoice?160:340;gain.gain.value=animeVoice?.92:.88;
-  const bright=echo.ctx.createBiquadFilter();bright.type='peaking';bright.frequency.value=animeVoice?3200:2450;bright.Q.value=.8;bright.gain.value=animeVoice?2.5:5;source.connect(filter);filter.connect(bright);bright.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
+  const profile=SPEECH_PROFILES[selectedAvatar];source.playbackRate.value=profile.echoRate;
+  filter.type='highpass';filter.frequency.value=profile.highpass;gain.gain.value=animeVoice?.95:.90;
+  const bright=echo.ctx.createBiquadFilter();bright.type='peaking';bright.frequency.value=profile.presence;bright.Q.value=.8;bright.gain.value=profile.presenceGain;source.connect(filter);filter.connect(bright);bright.connect(gain);gain.connect(echo.ctx.destination);echo.source=source;
   source.onended=()=>{try{source.disconnect();filter.disconnect();bright.disconnect();gain.disconnect()}catch{};source.buffer=null;if(token===echo.serial){echo.playing=false;echo.source=null;echo.cooldown=performance.now()+300;el('echo').textContent='🎤 말 따라하기 끄기'}};source.start();
  }catch(e){console.warn('Local voice echo unavailable:',e)}finally{if(token===echo.serial&&!echo.source){echo.playing=false;echo.cooldown=performance.now()+700;el('echo').textContent='🎤 말 따라하기 끄기'}echo.chunks.length=0;}
 }
 
 
-// Speech is based only on sustained facial expressions, never individual transient frames.
-const voiceState={kind:'neutral',since:0,lastAt:-30000,lastKind:'',lastSpoken:'',enabled:true};
-const voiceLines={joy:['좋은 일 있나 봐?','웃는 얼굴이 정말 보기 좋아!','오늘 기분이 좋은가 봐!'],negative:['무슨 일 있어? 한번 웃어 볼래?','괜찮아? 내가 응원할게!','조금 지쳤나 봐. 웃는 얼굴도 보여 줘!'],surprise:['와! 깜짝 놀랐나 봐!','무슨 재미있는 걸 봤어?']};
-function voiceSay(kind){
- if(!voiceState.enabled||echo.enabled||!('speechSynthesis' in window)||document.hidden)return;
- const lines=voiceLines[kind]||[];
- let line=lines.find(x=>x!==voiceState.lastSpoken)||lines[0]; if(!line)return;
- voiceState.lastSpoken=line; voiceState.lastKind=kind; voiceState.lastAt=performance.now();
- const bubble=el('voiceBubble');bubble.textContent=line;bubble.hidden=false;
- try{speechSynthesis.cancel();const s=new SpeechSynthesisUtterance(line);s.lang='ko-KR';s.rate=selectedAvatar==='anime'?1.02:1.2;s.pitch=selectedAvatar==='anime'?1.27:1.65;s.volume=.85;
- const voices=speechSynthesis.getVoices();const korean=voices.filter(v=>v.lang.toLowerCase().startsWith('ko'));
- // Prefer known feminine Korean voices if installed; browser/OS voices vary.
- const feminine=/female|woman|여성|여자|지현|유나|서연|하은|sunhi|heami|yuna|seo-yeon|sora/i;
- s.voice=selectedAvatar==='anime'?(korean.find(v=>feminine.test(v.name))||korean.find(v=>v.localService)||korean[0]||null):(korean.find(v=>v.localService)||korean[0]||null);
- s.onend=()=>{bubble.hidden=true};s.onerror=()=>{bubble.hidden=true};speechSynthesis.speak(s);
- }catch(e){hint('음성 출력이 제한되어 있어요. 화면을 한 번 눌러 주세요.')}
+// Speaking and microphone echo coexist. Suppress microphone VAD during synthesized
+// speech so a character never records and echoes its own voice.
+let voicePlaybackActive=false,voicePlaySerial=0,voiceWatchdog=0,voiceNeedsGesture=false;
+const voiceState={kind:'neutral',since:0,lastAt:-30000,lastKind:'',lastSpoken:'',enabled:true,
+ greeted:false,pendingGreetingAt:0,lastFaceSeenAt:-30000,waveSince:0,waveLatched:false};
+const voiceLines={
+ anime:{
+  greeting:['안녕! 내 표정이 너를 따라 움직이는지 볼래?','반가워! 나랑 웃는 얼굴을 만들어 볼까?'],
+  return:['다시 만나서 반가워!','돌아왔구나! 또 같이 놀자!'],
+  wave:['와, 손 흔드는 거 봤어! 나도 인사할게!','손을 들었네? 안녕, 반가워!'],
+  joy:['웃는 얼굴이 참 보기 좋아!','기분 좋은 일이 있나 봐!'],
+  negative:['무슨 일 있어? 내가 응원해 줄게!','괜찮아? 웃는 얼굴도 보여 줄래?'],
+  surprise:['우와! 무슨 일이야? 깜짝 놀랐어!','놀란 표정까지 똑같이 따라 할 수 있어!']
+ },
+ squirrel:{
+  greeting:['찍찍! 다람쥐 친구 등장! 반가워!','앗! 도토리 대신 친구가 나타났네!'],
+  return:['어라? 다시 왔네! 도토리 하나 줄까?','돌아왔구나! 내 도토리는 잘 있었지?'],
+  wave:['손 흔들기 대결이닷! 파다다닥!','으아! 손을 들었어! 나도 번쩍!'],
+  joy:['히히! 웃음이 도토리처럼 톡톡 터지네!','그 웃음, 내가 찜했어! 찍찍!'],
+  negative:['어라? 도토리 잃어버렸어? 힘내자!','으음! 속상할 땐 내가 응원해 줄게!'],
+  surprise:['으악! 깜짝이야! 내 도토리 어디 갔지?','헉! 나도 깜짝 놀라서 꼬리가 쭈뼛!']
+ }
+};
+function finishVoice(serial){
+ if(serial!==voicePlaySerial)return;
+ clearTimeout(voiceWatchdog);voiceWatchdog=0;
+ voicePlaybackActive=false;
+ echo.cooldown=Math.max(echo.cooldown,performance.now()+460);
+ const bubble=el('voiceBubble');if(bubble)bubble.hidden=true;
 }
-function updateVoice(ts, smile, negative, surprise){
- const kind=smile>.42?'joy':negative>.55?'negative':surprise>.7?'surprise':'neutral';
- if(kind!==voiceState.kind){voiceState.kind=kind;voiceState.since=ts;return}
- if(kind==='neutral'||!live||ts-voiceState.since<(kind==='negative'?2700:1700)||ts-voiceState.lastAt<20000)return;
- if(kind===voiceState.lastKind&&ts-voiceState.lastAt<40000)return;
- voiceSay(kind);voiceState.since=ts;
+function voiceSay(kind,ts=performance.now()){
+ if(!voiceState.enabled||!live||!('speechSynthesis' in window)||document.hidden||voiceNeedsGesture||echo.speaking||echo.playing||voicePlaybackActive)return false;
+ if(ts-voiceState.lastAt<(kind==='greeting'?0:6500))return false;
+ const lines=voiceLines[selectedAvatar]?.[kind]||[];
+ const line=lines.find(x=>x!==voiceState.lastSpoken)||lines[0];if(!line)return false;
+ const profile=SPEECH_PROFILES[selectedAvatar];
+ const serial=++voicePlaySerial;
+ try{
+  const s=new SpeechSynthesisUtterance(line);
+  s.lang='ko-KR';s.rate=profile.rate;s.pitch=profile.pitch;s.volume=profile.volume;
+  s.voice=chooseKoreanVoice(speechSynthesis.getVoices(),selectedAvatar);
+  s.onend=()=>finishVoice(serial);
+  s.onerror=e=>{
+   if(serial===voicePlaySerial&&e?.error==='not-allowed'){voiceNeedsGesture=true;hint('목소리를 재생하려면 화면을 한 번 눌러 주세요.');}
+   finishVoice(serial);
+  };
+  speechSynthesis.cancel();
+  voicePlaybackActive=true;
+  const bubble=el('voiceBubble');bubble.textContent=line;bubble.hidden=false;
+  speechSynthesis.speak(s);
+  // Some browser voices never emit end/error; never leave the mic VAD locked.
+  clearTimeout(voiceWatchdog);voiceWatchdog=setTimeout(()=>{if(serial===voicePlaySerial){speechSynthesis.cancel();finishVoice(serial)}},8500);
+  voiceState.lastSpoken=line;voiceState.lastKind=kind;voiceState.lastAt=ts;
+  return true;
+ }catch(e){finishVoice(serial);hint('음성 출력이 제한되어 있어요. 화면을 한 번 눌러 주세요.');return false;}
 }
-function clearVoice(){voiceState.kind='neutral';voiceState.since=0;try{speechSynthesis.cancel()}catch(e){}const b=el('voiceBubble');if(b)b.hidden=true}
+function updateVoice(ts,smile,negative,surprise){
+ // A stable face must remain visible before the first greeting is played.
+ if(voiceState.pendingGreetingAt&&ts>=voiceState.pendingGreetingAt){
+  const kind=voiceState.greeted?'return':'greeting';
+  if(voiceSay(kind,ts)){voiceState.greeted=true;voiceState.pendingGreetingAt=0;}
+ }
+ const kind=classifyExpression(smile,negative,surprise);
+ if(kind!==voiceState.kind){voiceState.kind=kind;voiceState.since=ts;return;}
+ if(kind==='neutral'||!live||ts-voiceState.since<(kind==='negative'?2500:1700))return;
+ if(kind===voiceState.lastKind&&ts-voiceState.lastAt<35000)return;
+ if(voiceSay(kind,ts))voiceState.since=ts;
+}
+function updateWaveVoice(points,ts){
+ const raised=armRaised(points,'left')||armRaised(points,'right');
+ if(!raised){voiceState.waveSince=0;voiceState.waveLatched=false;return;}
+ if(!voiceState.waveSince)voiceState.waveSince=ts;
+ if(!voiceState.waveLatched&&ts-voiceState.waveSince>=850){
+  if(voiceSay('wave',ts))voiceState.waveLatched=true;
+ }
+}
+function clearVoice(){
+ ++voicePlaySerial;voicePlaybackActive=false;clearTimeout(voiceWatchdog);voiceWatchdog=0;
+ voiceState.kind='neutral';voiceState.since=0;voiceState.pendingGreetingAt=0;
+ try{speechSynthesis.cancel()}catch(e){}
+ const bubble=el('voiceBubble');if(bubble)bubble.hidden=true;
+}
 
-let renderer,scene,camera,character,headBone,framing=null,morphMeshes=[],squirrelScene=null,animeMorphBindings=null,live=false,demo=false,session=0,stream=null,landmarker=null,lastVideoTime=-1,lastDetection=0,errorCount=0,hadFace=false,demoStart=0,temporaryEmotion=null,emotionUntil=0,modelReady=false;
+let renderer,scene,camera,character,headBone,neckBone,framing=null,morphMeshes=[],squirrelScene=null,animeMorphBindings=null,live=false,demo=false,session=0,stream=null,landmarker=null,lastVideoTime=-1,lastDetection=0,errorCount=0,hadFace=false,demoStart=0,temporaryEmotion=null,emotionUntil=0,modelReady=false;
 function status(x){el('status').textContent=x}function hint(x){el('hint').textContent=x}function err(x){el('error').textContent=x;el('error').classList.add('on')}function clearErr(){el('error').classList.remove('on')}
 function enable(){modelReady=true;for(const k of ['demo','happy','angry','sad'])el(k).disabled=false;el('loading').hidden=true;status('캐릭터 준비 완료');hint('카메라 연결을 시작합니다');startCamera();}
 function reset(){Object.assign(target,neutral)}
 function base64ToArrayBuffer(b64){const bin=atob(b64),arr=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);return arr.buffer}
-function stop(){stopInference();poseGoodAt=-10000;armTarget=0;bodyDetected=false;el('poseStatus').textContent='몸동작 대기';clearVoice();++session;live=false;demo=false;temporaryEmotion=null;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}video.pause();video.srcObject=null;el('videoBox').classList.remove('on');el('retry').hidden=false;el('stop').disabled=true;el('demo').classList.remove('active');reset();status('캐릭터 준비 완료');hint('카메라 연결이 종료됐습니다')}
+function stop(){if(echo.enabled||echo.starting)void stopEcho();voiceState.greeted=false;voiceState.waveSince=0;voiceState.waveLatched=false;stopInference();poseGoodAt=-10000;armTarget=0;bodyDetected=false;el('poseStatus').textContent='몸동작 대기';clearVoice();++session;live=false;demo=false;temporaryEmotion=null;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}video.pause();video.srcObject=null;el('videoBox').classList.remove('on');el('retry').hidden=false;el('stop').disabled=true;el('demo').classList.remove('active');reset();status('캐릭터 준비 완료');hint('카메라 연결이 종료됐습니다')}
 function emotion(type){if(!modelReady)return;if(live)stop();demo=false;el('demo').classList.remove('active');reset();temporaryEmotion=type;emotionUntil=performance.now()+4000;status('표정 미리보기: '+({joy:'웃음',angry:'화남',sorrow:'슬픔'})[type]);hint('실제 모델에 들어 있는 표정입니다')}
 for(const [id,key] of [['happy','joy'],['angry','angry'],['sad','sorrow']])el(id).onclick=()=>emotion(key);
 el('stop').onclick=()=>{stop();clearErr()};
@@ -300,11 +384,17 @@ el('demo').onclick=()=>{if(live)stop();demo=!demo;temporaryEmotion=null;demoStar
 el('full').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen()}catch(e){err('전체화면 전환을 지원하지 않습니다.')}};
 
 async function bindAvatar(gltf,kind){
+ // A rig cached between selections otherwise accumulates squirrel shoulder offsets
+ // and animated bone quaternions. Restore the actual original bind pose first.
+ let original=avatarBindPoses.get(gltf);
+ if(!original){original=[];gltf.scene.traverse(node=>original.push([node,node.quaternion.clone()]));avatarBindPoses.set(gltf,original)}
+ for(const [node,q] of original)node.quaternion.copy(q);
+ gltf.scene.updateMatrixWorld(true);
  if(character)scene.remove(character);
- character=gltf.scene;scene.add(character);idleFaceMix=1;idlePoseMix=1;idlePhaseShift=(kind==='squirrel'?.7:0);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;
- morphMeshes=[];headBone=null;animeMorphBindings=null;morphTracks=[];
+ character=gltf.scene;scene.add(character);idleFaceMix=1;idlePoseMix=1;idlePhaseShift=(kind==='squirrel'?.7:0);poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];poseGoodAt=-10000;poseBlend=0;poseRevision++;poseRigRevision=-1;
+ morphMeshes=[];headBone=null;neckBone=null;animeMorphBindings=null;morphTracks=[];
  for(const key of Object.keys(rigBones))delete rigBones[key];
- character.traverse(o=>{if(o.isMesh&&o.morphTargetInfluences?.length){morphMeshes.push(o);o.frustumCulled=false;}if(o.isSkinnedMesh)o.frustumCulled=false;});
+ character.traverse(o=>{if(o.isMesh&&o.morphTargetInfluences?.length){morphMeshes.push(o);o.frustumCulled=false;o.morphTargetInfluences.fill(0);}if(o.isSkinnedMesh)o.frustumCulled=false;});
  const vrmHumanoid=gltf.parser.json.extensions?.VRM?.humanoid?.humanBones||[];
  async function bone(name){const idx=vrmHumanoid.find(x=>x.bone===name)?.node;return idx===undefined?null:await gltf.parser.getDependency('node',idx)}
  headBone=await bone('head');if(headBone)headBone.userData.restRot=headBone.rotation.clone();
@@ -338,7 +428,7 @@ async function bindAvatar(gltf,kind){
   if(rightForearm)rightForearm.rotation.z-=.12;
  }
  for(const name of ['leftUpperArm','rightUpperArm','leftLowerArm','rightLowerArm','leftShoulder','rightShoulder','leftHand','rightHand','chest','upperChest']){
-  const b=await bone(name);if(b)rigBones[name]={bone:b,rest:b.quaternion.clone(),maxAngle:name.includes('LowerArm')?1.65:name.includes('UpperArm')?1.30:.35};
+  const b=await bone(name);if(b)rigBones[name]={bone:b,rest:b.quaternion.clone(),goal:b.quaternion.clone(),maxAngle:name.includes('LowerArm')?1.65:name.includes('UpperArm')?1.30:.35};
  }
  // VRM0 blendShapeMaster binds each preset to an actual mesh/target, rather than
  // relying on the squirrel's hardcoded morph indices.
@@ -379,7 +469,7 @@ async function bindAvatar(gltf,kind){
  if(size.y<.01)throw Error('모델 크기를 읽을 수 없습니다.');
  const headPos=new THREE.Vector3();if(headBone)headBone.getWorldPosition(headPos);else headPos.set(center.x,box.min.y+size.y*.79,center.z);
  // Center on actual face rather than full-body bounding box (long hair inflates width).
- const neckBone=await bone('neck'),chestBone=await bone('chest');
+ neckBone=await bone('neck');if(neckBone)neckBone.userData.restRot=neckBone.rotation.clone();const chestBone=await bone('chest');
  const chestPos=new THREE.Vector3();if(chestBone)chestBone.getWorldPosition(chestPos);else chestPos.set(headPos.x,headPos.y-size.y*.22,headPos.z);
  const headToChest=Math.max(.12,headPos.y-chestPos.y);
  framing={height:size.y,width:size.x,centerX:headPos.x,faceZ:headPos.z,headY:headPos.y,chestY:chestPos.y,headToChest,kind,
@@ -389,6 +479,7 @@ async function bindAvatar(gltf,kind){
  camera.lookAt(framing.centerX,framing.focusY,framing.faceZ);
  configureCamera();
  if(!morphMeshes.length)throw Error('표정 메시를 찾지 못했습니다.');
+ boundAvatarKind=kind;
 }
 
 async function model(){
@@ -432,15 +523,17 @@ function configureCamera(){
  camera.updateProjectionMatrix();
 }
 function draw(ts){requestAnimationFrame(draw);if(document.hidden||!renderer||!camera)return;
- frameAt=ts;fpsFrames++;
- if(ts-fpsAt>1200){const measured=Math.round(fpsFrames*1000/Math.max(1,ts-fpsAt));const fpsEl=el('fps');if(fpsEl)fpsEl.textContent=`${measured} fps`;fpsFrames=0;fpsAt=ts;}
+ frameAt=ts;
+ const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;frameDelta=dt;
+ fpsFrames++;
+ if(ts-fpsAt>1200){const measured=Math.round(fpsFrames*1000/Math.max(1,ts-fpsAt));const fpsEl=el('fps');if(fpsEl){fpsEl.textContent=`${measured} fps`;fpsEl.title=`렌더 버퍼 ${canvas.width}×${canvas.height} · 웹캠 ${video.videoWidth||0}×${video.videoHeight||0} · 얼굴 추론 ${Math.round(aiPerf.faceCost)}ms · 팔 추론 ${Math.round(aiPerf.poseCost)}ms`;}fpsFrames=0;fpsAt=ts;}
  const w=canvas.clientWidth,h=canvas.clientHeight;
  if(w&&h&&(w!==lastWidth||h!==lastHeight||lastDpr!==window.devicePixelRatio)){
   lastDpr=window.devicePixelRatio;
   lastWidth=w;lastHeight=h;
   const landscape=w>=h,limitW=landscape?1920:1080,limitH=landscape?1080:1920;
   const ratio=Math.min(window.devicePixelRatio||1,2,limitW/w,limitH/h);
-  renderer.setPixelRatio(Math.max(.25,ratio));
+  renderer.setPixelRatio(ratio);
   renderer.setSize(w,h,false);configureCamera();
  }
  if(demo&&!live){const t=(ts-demoStart)*.001;reset();const phase=(Math.floor(t/2.7)%6);const s=Math.sin(t*3.0);if(phase===0){target.joy=.85;target.a=Math.max(0,s)*.45}else if(phase===1){target.angry=.9;target.e=.3}else if(phase===2){target.sorrow=.9;target.o=.3}else if(phase===3){target.fun=.9;target.a=Math.max(0,s)*.95}else if(phase===4){target.i=.85;target.u=.25}else{target.a=.9;target.o=.1}target.blink_l=Math.pow(Math.max(0,Math.sin(t*2.3)),25);target.blink_r=target.blink_l;target.yaw=Math.sin(t*.8)*.17;target.roll=Math.sin(t*.95)*.1}
@@ -454,21 +547,24 @@ function draw(ts){requestAnimationFrame(draw);if(document.hidden||!renderer||!ca
  const idleStep=1-Math.exp(-frameDelta*2.5);
  idleFaceMix+=(idleFaceGoal-idleFaceMix)*idleStep;
  if(idleAllowed&&!faceTracking)reset();
+ // IMPORTANT: never accumulate idle offsets into the persistent face tracker
+ // target. That previously let a 60fps idle animation overpower the actual
+ // chin-up/down, smile and wink after just a few seconds of tracking.
+ for(const key of expressionKeys)renderTarget[key]=target[key];
  if(idleAllowed&&idleFaceMix>.001){
   const f=idleFaceMix;
-  target.blink_l=Math.max(target.blink_l,idle.blink*f);
-  target.blink_r=Math.max(target.blink_r,idle.blink*f);
-  target.yaw+=idle.glance*f;
-  target.roll+=idle.tilt*f;
-  target.pitch+=idle.pitch*f;
+  renderTarget.blink_l=Math.max(renderTarget.blink_l,idle.blink*f);
+  renderTarget.blink_r=Math.max(renderTarget.blink_r,idle.blink*f);
+  renderTarget.yaw+=idle.glance*f;
+  renderTarget.roll+=idle.tilt*f;
+  renderTarget.pitch+=idle.pitch*f;
   // A subtle friendly idle expression, not a fixed open-mouth grin.
-  target.joy+=f*(idle.animal?.18:.13)*(0.55+.45*Math.sin(idle.t*.4));
-  if(idle.animal){target.a+=f*.035*Math.max(0,Math.sin(idle.t*.65));}
+  renderTarget.joy+=f*(idle.animal?.18:.13)*(0.55+.45*Math.sin(idle.t*.4));
+  if(idle.animal){renderTarget.a+=f*.035*Math.max(0,Math.sin(idle.t*.65));}
  }
 
- const dt=Math.max(0,Math.min(.05,(ts-lastPoseFrame)/1000||.016));lastPoseFrame=ts;frameDelta=dt;
  // Time-correct smoothing keeps the same feel at 30/60/120Hz.
- for(const key of expressionKeys){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(target[key]-current[key])*(1-Math.pow(1-k,dt*60))}
+ for(const key of expressionKeys){const k=key.startsWith('blink')?.62:key==='yaw'||key==='roll'||key==='pitch'?.33:key==='joy'||key==='angry'||key==='sorrow'||key==='fun'?.23:.42;current[key]+=(renderTarget[key]-current[key])*(1-Math.pow(1-k,dt*60))}
  // Direct-write the cached mesh/morph pairs. No per-frame Map/Object.entries or push/clear.
  for(const track of morphTracks){
   let value=0;
@@ -476,7 +572,10 @@ function draw(ts){requestAnimationFrame(draw);if(document.hidden||!renderer||!ca
   value=clamp(value);
   if(Math.abs(track.mesh.morphTargetInfluences[track.index]-value)>0.0001)track.mesh.morphTargetInfluences[track.index]=value;
  }
- if(headBone){const rest=headBone.userData.restRot;headBone.rotation.set(rest.x+current.pitch*.23,rest.y+current.yaw*.30,rest.z-current.roll*.25)}
+ // Split real head pose across the neck and head (local Z and X axes are
+ // reversed relative to MediaPipe's camera after the VRM Y=PI root turn).
+ if(neckBone){const rest=neckBone.userData.restRot;neckBone.rotation.set(rest.x-current.pitch*.17,rest.y+current.yaw*.17,rest.z-current.roll*.14)}
+ if(headBone){const rest=headBone.userData.restRot;headBone.rotation.set(rest.x-current.pitch*.65,rest.y+current.yaw*.64,rest.z-current.roll*.55)}
  updatePoseAnimation(ts);
  renderer.render(scene,camera);
  // AI inference runs in its own bounded scheduler; never call detectForVideo inside RAF.
@@ -488,8 +587,14 @@ function detect(ts){if(!landmarker||video.readyState<2||video.currentTime===last
  catch(e){if(++errorCount>=10){stop();err('표정 분석이 반복 실패했습니다: '+(e?.message||e))}}
 }
 function applyFaceResult(r,ts){
- try{const categories=r.faceBlendshapes?.[0]?.categories||[];if(!categories.length){clearVoice();reset();if(hadFace)hint('얼굴을 카메라에 보여 주세요');hadFace=false;return}
- if(!hadFace){hadFace=true;hint('좋아요! 웃거나 눈을 감거나 입을 벌려 보세요')}const b={};for(const p of categories)b[p.categoryName]=p.score;
+ try{const categories=r.faceBlendshapes?.[0]?.categories||[];
+ const hasScores=r.blendScores?Object.keys(r.blendScores).length>0:categories.length>0;
+ if(!hasScores){voiceState.kind='neutral';voiceState.since=0;voiceState.pendingGreetingAt=0;reset();if(hadFace)hint('얼굴을 카메라에 보여 주세요');hadFace=false;return}
+ if(!hadFace){hadFace=true;const returning=voiceState.greeted&&ts-voiceState.lastFaceSeenAt>4000;
+  if(!voiceState.greeted||returning)voiceState.pendingGreetingAt=ts+680;
+  hint('좋아요! 웃거나 눈을 감거나 입을 벌려 보세요')}
+ voiceState.lastFaceSeenAt=ts;const b=r.blendScores||{};
+ if(!r.blendScores)for(const p of categories)b[p.categoryName]=p.score;
  reset();target.blink_l=clamp(score(b,'eyeBlinkLeft')*1.35);target.blink_r=clamp(score(b,'eyeBlinkRight')*1.35);
  target.joy=clamp((score(b,'mouthSmileLeft')+score(b,'mouthSmileRight'))*.66);
  target.angry=clamp((score(b,'browDownLeft')+score(b,'browDownRight'))*.43+(score(b,'mouthFrownLeft')+score(b,'mouthFrownRight'))*.18);
@@ -504,7 +609,13 @@ function applyFaceResult(r,ts){
  const mouthSum=target.a+target.i+target.u+target.e+target.o;
  if(mouthSum>1){for(const k of ['a','i','u','e','o'])target[k]/=mouthSum}
 
- const pts=r.faceLandmarks?.[0];if(pts){const le=pts[33],re=pts[263],nose=pts[1],dist=Math.max(.05,Math.abs(re.x-le.x));target.roll=clamp((re.y-le.y)/dist,-.7,.7);target.yaw=clamp((nose.x-(le.x+re.x)*.5)/dist*1.35,-.7,.7);}
+ // Prefer full 3D head orientation; the old 2D three-point method cannot
+ // determine chin-up/chin-down (pitch) at all and exaggerates yaw off-center.
+ const pose=headPoseFromMatrix(r.headMatrix||r.facialTransformationMatrixes?.[0]?.data);
+ if(pose){target.pitch=pose.pitch;target.yaw=pose.yaw;target.roll=pose.roll;}
+ else {const pts=r.faceLandmarks?.[0],head=r.headPoints;
+  if(pts||head){const le=head?.left||pts[33],re=head?.right||pts[263],nose=head?.nose||pts[1],dist=Math.max(.05,Math.abs(re.x-le.x));target.roll=clamp((re.y-le.y)/dist,-.7,.7);target.yaw=clamp((nose.x-(le.x+re.x)*.5)/dist*1.35,-.7,.7);}}
+
  const isSurprise=jaw>.68&&score(b,'eyeWideLeft')+score(b,'eyeWideRight')>.55;
  updateVoice(ts, target.joy, Math.max(target.angry,target.sorrow),isSurprise?1:0);
  errorCount=0;
@@ -547,8 +658,8 @@ function detectPose(ts){
  }catch(e){if(++poseErrors===8){console.warn("Pose detection disabled after errors",e);poseLandmarker=null;el("poseStatus").textContent="몸동작 추적 중지 · 얼굴은 유지"}}
 }
 function applyPoseResult(result,ts){
- try{const points=result.landmarks?.[0];
-  if(!points){poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];armTarget=0;return;}
+ try{poseRevision++;const points=result.points||result.landmarks?.[0];
+  if(!points){poseInfo.left=[];poseInfo.right=[];poseSmooth.left=[];poseSmooth.right=[];armTarget=0;voiceState.waveSince=0;voiceState.waveLatched=false;return;}
   const visible=(n)=>points[n]&&(points[n].visibility??1)>.48&&(points[n].presence??1)>.45;
   // Force both limb endpoints visible before applying; avoids huge arm swings at occlusion.
   for(const [side,idx] of [['left',[11,13,15]],['right',[12,14,16]]]){
@@ -574,7 +685,7 @@ function applyPoseResult(result,ts){
    poseInfo.lean=clamp((points[12].y-points[11].y)*1.8,-.27,.27);
   }
   if(poseInfo.left.length||poseInfo.right.length){
-   poseGoodAt=ts;bodyDetected=true;el('poseStatus').textContent='얼굴 + 팔·어깨 추적 중';
+   poseGoodAt=ts;bodyDetected=true;if(el('poseStatus').textContent!=='얼굴 + 팔·어깨 추적 중')el('poseStatus').textContent='얼굴 + 팔·어깨 추적 중';
    let maxPose=0;
    for(const key of ['left','right']){
     const arm=poseInfo[key];if(arm.length){
@@ -585,7 +696,8 @@ function applyPoseResult(result,ts){
     }
    }
    armTarget=maxPose;
-  }else{armTarget=0;}
+   updateWaveVoice(points,ts);
+  }else{armTarget=0;voiceState.waveSince=0;voiceState.waveLatched=false;}
   poseErrors=0;
  }catch(e){if(++poseErrors===8){console.warn('Pose detection disabled after errors:',e);poseLandmarker=null;el('poseStatus').textContent='몸동작 추적 중지 · 얼굴은 유지';}}
 }
@@ -613,25 +725,23 @@ function aimBone(entry,nextBone,dx,dy,dz,alpha){
  aimDeltaQ.copy(entry.rest).invert().multiply(desiredLocal);
  const angle=2*Math.acos(clamp(Math.abs(aimDeltaQ.w),0,1));
  if(angle>maxAngle){desiredLocal.copy(entry.rest).slerp(desiredLocal,maxAngle/angle)}
- bone.quaternion.slerp(desiredLocal,alpha);
+ entry.goal.copy(desiredLocal);
+ bone.quaternion.slerp(entry.goal,alpha);
  bone.updateMatrixWorld(true);
 }
-function segmentDirection(p,q){
- // MediaPipe input is unmirrored, while the visitor sees a mirrored selfie.
- // Render canvas is mirrored in CSS to match the mirrored webcam preview.
- const dx=(q.x-p.x),dy=-(q.y-p.y),dz=clamp((p.z-q.z)*.34,-.32,.32);
- const norm=Math.hypot(dx,dy,dz)||1;
- return [dx/norm,dy/norm,dz/norm];
-}
+// Camera/model mirror mapping is shared with the automated geometry tests.
+
 function updatePoseAnimation(ts){
  if(!character)return;
  const active=live && (ts-poseGoodAt<800);
- const idle=idleSample(ts);
+ const newPose=active&&poseRigRevision!==poseRevision;
+ if(newPose)poseRigRevision=poseRevision;
+ const idle=idleFrame;
  const idleGoal=(!demo&&!temporaryEmotion&&!active)?1:0;
  const smoothIdle=1-Math.exp(-frameDelta*2.0);
  idlePoseMix+=(idleGoal-idlePoseMix)*smoothIdle;
  poseBlend=smoothing(poseBlend,active?1:0,active?.24:.11);
- if(!active){armTarget=0;if(bodyDetected&&ts-poseGoodAt>1300){bodyDetected=false;el('poseStatus').textContent='팔·어깨를 카메라에 보여 주세요'}}
+ if(!active){poseRigRevision=-1;armTarget=0;if(bodyDetected&&ts-poseGoodAt>1300){bodyDetected=false;el('poseStatus').textContent='팔·어깨를 카메라에 보여 주세요'}}
  // Camera remains fixed as arms move. No dynamic zoom or recentering.
  if(active)poseLeanQ.setFromEuler(poseEuler.set(0,0,(poseInfo.lean+poseInfo.waist)*.20*poseBlend));
  for(const key of torsoKeys){
@@ -645,7 +755,7 @@ function updatePoseAnimation(ts){
   }
   entry.bone.quaternion.slerp(poseChestQ,.18);
  }
- character.updateMatrixWorld(true);
+ if(newPose)character.updateMatrixWorld(true);
  for(const side of poseSides){
   const shoulderEntry=rigBones[side+'Shoulder'];
   const upper=rigBones[side+'UpperArm'],lower=rigBones[side+'LowerArm'];
@@ -658,10 +768,16 @@ function updatePoseAnimation(ts){
     shoulderEntry.bone.quaternion.slerp(poseShoulderQ,.2*poseBlend);
     shoulderEntry.bone.updateMatrixWorld(true);
    }
-   const first=segmentDirection(shoulder,elbow),second=segmentDirection(elbow,wrist);
-   // The model faces +Z after rotation and image x is screen x. Child vectors supply anatomical sign.
-   aimBone(upper,lower.bone,...first,.32*poseBlend);
-   aimBone(lower,palm.bone,...second,.33*poseBlend);
+   if(newPose){
+    cameraSegmentToModel(shoulder,elbow,firstSegment);
+    cameraSegmentToModel(elbow,wrist,secondSegment);
+    aimBone(upper,lower.bone,firstSegment.x,firstSegment.y,firstSegment.z,.32*poseBlend);
+    aimBone(lower,palm.bone,secondSegment.x,secondSegment.y,secondSegment.z,.33*poseBlend);
+   }else{
+    // Solve IK only on new camera inference; interpolate the cached goal at 60 fps.
+    upper.bone.quaternion.slerp(upper.goal,.32*poseBlend);
+    lower.bone.quaternion.slerp(lower.goal,.33*poseBlend);
+   }
   }else{
    // Return to relaxed arm rest, with gentle asymmetric movement while idle.
    const sign=side==='left'?1:-1;
@@ -683,7 +799,7 @@ function updatePoseAnimation(ts){
     lower.bone.quaternion.slerp(idleMotionQ,.11);
    }
   }
-  if(upper)upper.bone.updateMatrixWorld(true);
+  // renderer.render() updates world matrices once; no extra forced subtree traversal.
  }
 }
 
@@ -692,7 +808,7 @@ async function getLandmarker(){
  const {lib:{FaceLandmarker},wasm}=await loadVisionRuntime();
  landmarker=await FaceLandmarker.createFromOptions(wasm,{
   baseOptions:{modelAssetPath:'./models/face_landmarker.task',delegate:'CPU'},
-  runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:true
+  runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:true,outputFacialTransformationMatrixes:true
  });
  return landmarker;
 }
@@ -700,7 +816,7 @@ async function startCamera(){if(!modelReady||autoStarting||live)return;autoStart
  if(!navigator.mediaDevices?.getUserMedia)throw Error('카메라는 HTTPS 또는 localhost에서만 사용 가능합니다.');
  // Begin loading AI model while user is answering the camera permission prompt.
  const faceReady=initInferenceWorker().catch(e=>{console.warn('Worker unavailable; using main-thread inference',e);return getLandmarker()});faceReady.catch(()=>{});
- let s;try{s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'user'},width:{ideal:480},height:{ideal:360},frameRate:{ideal:30}},audio:false})}
+ let s;try{s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'user'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false})}
  catch(firstError){if(firstError.name==='OverconstrainedError'||firstError.name==='NotFoundError'||firstError.name==='NotReadableError')s=await navigator.mediaDevices.getUserMedia({video:true,audio:false});else throw firstError;}if(token!==session){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;await video.play();if(token!==session){s.getTracks().forEach(t=>t.stop());return}el('videoBox').classList.add('on');if(!echo.enabled&&!echo.starting)toggleEcho();status('AI 모델 준비 중');hint('얼굴 인식 모델을 불러오는 중입니다');await faceReady;if(token!==session)return;
  // Pose is optional and starts in parallel; a failed pose download must not block face tracking.
  if(!workerReady)setTimeout(()=>{if(token===session)getPoseLandmarker().catch(e=>console.warn('Pose unavailable:',e));},500);
@@ -712,6 +828,6 @@ async function startCamera(){if(!modelReady||autoStarting||live)return;autoStart
  hint(cameraError?'카메라를 연결하거나 권한을 허용한 후 재연결해 주세요':'AI 모델 파일을 확인한 후 다시 연결해 주세요');}}finally{autoStarting=false}}
 el('retry').onclick=startCamera;
 el('voice').onclick=()=>{voiceState.enabled=!voiceState.enabled;el('voice').textContent=voiceState.enabled?'🔊 목소리 켜짐':'🔇 목소리 꺼짐';if(!voiceState.enabled)clearVoice();else{try{speechSynthesis.getVoices()}catch(e){}}};
-window.addEventListener('pointerdown',()=>{if(voiceState.enabled&&'speechSynthesis' in window){speechSynthesis.resume()}},{passive:true});
+window.addEventListener('pointerdown',()=>{voiceNeedsGesture=false;if(voiceState.enabled&&'speechSynthesis' in window){speechSynthesis.resume()}},{passive:true});
 el('echo').onclick=toggleEcho;window.addEventListener('pagehide',()=>{stop();stopEcho()});document.addEventListener('visibilitychange',()=>{if(document.hidden){if(live)stop();if(echo.enabled)stopEcho()}else if(modelReady&&!live&&!autoStarting)startCamera()});
 model();requestAnimationFrame(draw);

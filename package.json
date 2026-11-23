@@ -1,11 +1,12 @@
 {
   "name": "ai-expression-friend-selfhost",
   "private": true,
-  "version": "17.0.0",
+  "version": "24.0.0",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "node --check main.js && node --check inference-worker.js && node --check scripts/build.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check main.js && node --check interaction-core.js && node --check inference-worker.js && node --check scripts/build.mjs"
   },
   "dependencies": {
     "three": "0.170.0",
